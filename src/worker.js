@@ -33,7 +33,7 @@ import { ethers } from 'ethers';
 /* Configuración fija                                                  */
 /* ================================================================== */
 
-const GRIDBOT = '0x86641CD8518c12346790E82808988A554F9F480C';
+const GRIDBOT = '0x4e86430BC2260FE359d1Ea7Eef8B595fB241F93B';
 
 // RPC públicos de BSC (gratis, sin API key). Se prueban en orden.
 const RPCS = [
