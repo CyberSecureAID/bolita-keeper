@@ -1,0 +1,8 @@
+name = "bolita-keeper"
+main = "src/worker.js"
+compatibility_date = "2024-09-01"
+compatibility_flags = ["nodejs_compat"]
+
+# El keeper mira los precios cada minuto.
+[triggers]
+crons = ["* * * * *"]
