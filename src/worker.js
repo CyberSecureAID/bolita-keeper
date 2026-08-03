@@ -45,7 +45,7 @@ const RPCS = [
 ];
 
 const MAX_ACCIONES = 8;    // máximo de transacciones por corrida (no pasarse de tiempo/gas)
-const RANGO_LOGS   = 2000; // tamaño de ventana al buscar eventos (seguro para RPC públicos)
+const RANGO_LOGS   = 500;  // tamaño de ventana al buscar eventos (seguro para RPC públicos)
 
 // Solo lo que el keeper necesita del contrato.
 const ABI = [
@@ -106,13 +106,16 @@ async function descubrir(cRead, estado, latest, log) {
   const filtro = cRead.filters.RejillaCreada();
   const vistos = new Set(estado.grids.map(idGrid));
   let desde = estado.lastBlock + 1;
+  let ventana = RANGO_LOGS;
 
   while (desde <= latest) {
-    const hasta = Math.min(desde + RANGO_LOGS - 1, latest);
+    const hasta = Math.min(desde + ventana - 1, latest);
     let eventos;
     try {
       eventos = await cRead.queryFilter(filtro, desde, hasta);
     } catch (e) {
+      // Si el RPC limita el rango, reduce la ventana y reintenta ese mismo tramo.
+      if (ventana > 100) { ventana = Math.floor(ventana / 2); continue; }
       log.push(`getLogs ${desde}-${hasta}: ${e?.message || e}`);
       break; // no avanzamos lastBlock más allá de lo escaneado
     }
@@ -127,6 +130,7 @@ async function descubrir(cRead, estado, latest, log) {
     }
     estado.lastBlock = hasta;
     desde = hasta + 1;
+    ventana = RANGO_LOGS; // restablece la ventana tras un tramo exitoso
   }
 }
 
