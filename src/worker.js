@@ -53,11 +53,24 @@ const ABI = [
   'function resumen(address usuario, address base, address quote) view returns (tuple(address base,address quote,bool activa,uint256 niveles,uint256 armados,uint256 creadaEn,uint256 ultimaOpEn,uint256 comprasHechas,uint256 ventasHechas,uint256 ciclos,uint256 totalOps,uint256 posicionBase,uint256 costeQuote,uint256 volumenQuote,int256 gananciaQuote,uint256 gasSaldoWei,uint256 gasGastadoWei,uint256 ordenQuote,uint256 ordenBase,uint128 tpUnitOut,uint128 slUnitOut,uint16 slippageBps,uint32 cooldownSeg))',
   'function nivelesDe(bytes32 k) view returns (tuple(uint128 minOutCompra,uint128 minOutVenta,uint8 estado)[])',
   'function pathsDe(bytes32 k) view returns (address[] compra, address[] venta)',
-  'function cotizar(uint256 amountIn, address[] path) view returns (uint256)',
   'function ejecutar(address usuario, address base, address quote, uint256 i) external',
   'function cerrarPorTPSL(address usuario, address base, address quote) external',
   'event RejillaCreada(address indexed usuario, address indexed base, address indexed quote, bytes32 clave, uint256 niveles, bool nueva)'
 ];
+
+// PancakeSwap V3 QuoterV2: precio real del pool que usa el contrato (fee 0.05%).
+const QUOTER_V3 = '0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997';
+const FEE_V3    = 500;
+const QUOTER_ABI = [
+  'function quoteExactInputSingle((address tokenIn,address tokenOut,uint256 amountIn,uint24 fee,uint160 sqrtPriceLimitX96)) returns (uint256 amountOut,uint160 sqrtPriceX96After,uint32 initializedTicksCrossed,uint256 gasEstimate)'
+];
+// Cuánto rinde `amountIn` de tokenIn en tokenOut por V3. Devuelve 0 si no hay pool/liquidez.
+async function quoteV3(quoter, tokenIn, tokenOut, amountIn) {
+  try {
+    const r = await quoter.quoteExactInputSingle.staticCall({ tokenIn, tokenOut, amountIn, fee: FEE_V3, sqrtPriceLimitX96: 0n });
+    return r[0];
+  } catch { return 0n; }
+}
 
 /* ================================================================== */
 /* RPC con respaldo                                                    */
@@ -146,13 +159,11 @@ async function procesarRejilla(cRead, cWrite, g, gasMin, log) {
   const k = ethers.solidityPackedKeccak256(
     ['address', 'address', 'address'], [g.u, g.b, g.q]
   );
-  const paths = await cRead.pathsDe(k);
-  const pathCompra = paths.compra ?? paths[0];
-  const pathVenta  = paths.venta  ?? paths[1];
+  const quoter = new ethers.Contract(QUOTER_V3, QUOTER_ABI, cRead.runner);
 
   // 1) TP/SL primero: si se alcanzó, cierra toda la rejilla.
   if (R.tpUnitOut > 0n || R.slUnitOut > 0n) {
-    const precioVenta = await cRead.cotizar(R.ordenBase, pathVenta);
+    const precioVenta = await quoteV3(quoter, g.b, g.q, R.ordenBase);
     const tp = R.tpUnitOut > 0n && precioVenta >= R.tpUnitOut;
     const sl = R.slUnitOut > 0n && precioVenta <= R.slUnitOut;
     if (tp || sl) {
@@ -165,8 +176,8 @@ async function procesarRejilla(cRead, cWrite, g, gasMin, log) {
 
   // 2) Niveles: una cotización por dirección sirve para todos los niveles.
   const niveles = await cRead.nivelesDe(k);
-  const outCompra = await cRead.cotizar(R.ordenQuote, pathCompra); // base que rinde ordenQuote
-  const outVenta  = await cRead.cotizar(R.ordenBase, pathVenta);   // quote que rinde ordenBase
+  const outCompra = await quoteV3(quoter, g.q, g.b, R.ordenQuote); // base que rinde ordenQuote (V3)
+  const outVenta  = await quoteV3(quoter, g.b, g.q, R.ordenBase);  // quote que rinde ordenBase (V3)
 
   for (let i = 0; i < niveles.length; i++) {
     const estado = Number(niveles[i].estado);
