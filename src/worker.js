@@ -44,8 +44,10 @@ const RPCS = [
   'https://1rpc.io/bnb'
 ];
 
-const MAX_ACCIONES = 8;    // máximo de transacciones por corrida (no pasarse de tiempo/gas)
-const RANGO_LOGS   = 500;  // tamaño de ventana al buscar eventos (seguro para RPC públicos)
+const MAX_ACCIONES = 8;     // máximo de transacciones por corrida (no pasarse de tiempo/gas)
+const RANGO_LOGS   = 500;   // tamaño de ventana al buscar eventos (seguro para RPC públicos)
+const LOOKBACK     = 28000; // al arrancar de cero, mira ~24h atrás para hallar bots ya existentes
+const MAX_SCAN     = 14000; // bloques máximos a escanear por corrida (el resto se sigue en la siguiente)
 
 // Solo lo que el keeper necesita del contrato.
 const ABI = [
@@ -119,10 +121,11 @@ async function descubrir(cRead, estado, latest, log) {
   const filtro = cRead.filters.RejillaCreada();
   const vistos = new Set(estado.grids.map(idGrid));
   let desde = estado.lastBlock + 1;
+  const tope = Math.min(latest, desde + MAX_SCAN - 1); // no más de MAX_SCAN bloques por corrida
   let ventana = RANGO_LOGS;
 
-  while (desde <= latest) {
-    const hasta = Math.min(desde + ventana - 1, latest);
+  while (desde <= tope) {
+    const hasta = Math.min(desde + ventana - 1, tope);
     let eventos;
     try {
       eventos = await cRead.queryFilter(filtro, desde, hasta);
@@ -211,7 +214,7 @@ async function correr(env, log) {
 
   const latest = await provider.getBlockNumber();
   const estado = await cargarEstado(env);
-  if (estado.lastBlock === 0) estado.lastBlock = latest; // primera vez: arranca desde ahora
+  if (estado.lastBlock === 0) estado.lastBlock = Math.max(0, latest - LOOKBACK); // primera vez: mira atrás para hallar bots existentes
 
   await descubrir(cRead, estado, latest, log);
 
