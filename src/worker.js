@@ -56,6 +56,8 @@ const ABI = [
   'function nivelesDe(bytes32 k) view returns (tuple(uint128 minOutCompra,uint128 minOutVenta,uint8 estado)[])',
   'function pathsDe(bytes32 k) view returns (address[] compra, address[] venta)',
   'function ejecutar(address usuario, address base, address quote, uint256 i) external',
+  'function modoDe(address usuario, address base, address quote) view returns (uint8 modo, uint16 objetivoBps)',
+  'function venderAcumulado(address usuario, address base, address quote) external',
   'function cerrarPorTPSL(address usuario, address base, address quote) external',
   'event RejillaCreada(address indexed usuario, address indexed base, address indexed quote, bytes32 clave, uint256 niveles, bool nueva)'
 ];
@@ -165,6 +167,10 @@ async function procesarRejilla(cRead, cWrite, g, gasMin, log) {
   );
   const quoter = new ethers.Contract(QUOTER_V3, QUOTER_ABI, cRead.runner);
 
+  // Tipo de bot: 0 = cuadrícula · 1 = acumulador
+  let modo = 0, objBps = 0n;
+  try { const md = await cRead.modoDe(g.u, g.b, g.q); modo = Number(md[0]); objBps = BigInt(md[1]); } catch (_) {}
+
   // 1) TP/SL primero: si se alcanzó, cierra toda la rejilla.
   if (R.tpUnitOut > 0n || R.slUnitOut > 0n) {
     const precioVenta = await quoteV3(quoter, g.b, g.q, R.ordenBase);
@@ -183,6 +189,18 @@ async function procesarRejilla(cRead, cWrite, g, gasMin, log) {
   const outCompra = await quoteV3(quoter, g.q, g.b, R.ordenQuote); // base que rinde ordenQuote (V3)
   const outVenta  = await quoteV3(quoter, g.b, g.q, R.ordenBase);  // quote que rinde ordenBase (V3)
 
+  // ACUMULADOR: si la posición completa ya gana el objetivo, vende TODO de golpe.
+  if (modo === 1 && R.posicionBase > 0n) {
+    const valor = await quoteV3(quoter, g.b, g.q, R.posicionBase);
+    const minObj = R.costeQuote * (10000n + objBps) / 10000n;
+    if (valor > 0n && valor >= minObj) {
+      const tx = await cWrite.venderAcumulado(g.u, g.b, g.q);
+      await tx.wait();
+      log.push(`  ${et}: ACUMULADOR — VENTA TOTAL (valor ${valor} ≥ objetivo ${minObj}) tx ${tx.hash}`);
+      return true;
+    }
+  }
+
   let armC = 0, armV = 0, ventaLista = false;
   for (const nv of niveles) {
     const e = Number(nv.estado);
@@ -199,7 +217,12 @@ async function procesarRejilla(cRead, cWrite, g, gasMin, log) {
       log.push(`COMPRA nivel ${i} ${g.b}/${g.q} de ${g.u} tx ${tx.hash}`);
       return true;
     }
-    if (estado === 2 && outVenta >= niveles[i].minOutVenta) {
+    if (modo === 0 && estado === 2 && outVenta >= niveles[i].minOutVenta) {
+      // Margen V6: no disparar si aún no cubre el coste promedio del tramo (evita revert).
+      if (R.posicionBase > 0n) {
+        const costeOrden = R.costeQuote * R.ordenBase / R.posicionBase;
+        if (outVenta < costeOrden) continue;
+      }
       const tx = await cWrite.ejecutar(g.u, g.b, g.q, i);
       await tx.wait();
       log.push(`VENTA nivel ${i} ${g.b}/${g.q} de ${g.u} tx ${tx.hash}`);
@@ -224,6 +247,8 @@ async function correr(env, log) {
   const latest = await provider.getBlockNumber();
   const estado = await cargarEstado(env);
   if (estado.lastBlock === 0) estado.lastBlock = Math.max(0, latest - LOOKBACK); // primera vez: mira atrás para hallar bots existentes
+  // Auto-sanación: si no conoce ningún bot, reescanea la ventana hacia atrás (halla bots que se hayan perdido).
+  if (estado.grids.length === 0 && estado.lastBlock > latest - LOOKBACK) estado.lastBlock = Math.max(0, latest - LOOKBACK);
 
   await descubrir(cRead, estado, latest, log);
 
