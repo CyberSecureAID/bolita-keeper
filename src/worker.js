@@ -155,9 +155,10 @@ async function descubrir(cRead, estado, latest, log) {
 /* ================================================================== */
 
 async function procesarRejilla(cRead, cWrite, g, gasMin, log) {
+  const et = `${g.b.slice(0, 6)}/${g.q.slice(0, 6)} de ${g.u.slice(0, 6)}`;
   const R = await cRead.resumen(g.u, g.b, g.q);
-  if (!R.activa) return false;
-  if (R.gasSaldoWei < gasMin) return false; // sin gas: el contrato revertiría, no gastamos
+  if (!R.activa) { log.push(`  ${et}: INACTIVA, salto`); return false; }
+  if (R.gasSaldoWei < gasMin) { log.push(`  ${et}: SIN GAS (saldo ${R.gasSaldoWei} < min ${gasMin}) — recarga BNB al bot`); return false; }
 
   const k = ethers.solidityPackedKeccak256(
     ['address', 'address', 'address'], [g.u, g.b, g.q]
@@ -181,6 +182,14 @@ async function procesarRejilla(cRead, cWrite, g, gasMin, log) {
   const niveles = await cRead.nivelesDe(k);
   const outCompra = await quoteV3(quoter, g.q, g.b, R.ordenQuote); // base que rinde ordenQuote (V3)
   const outVenta  = await quoteV3(quoter, g.b, g.q, R.ordenBase);  // quote que rinde ordenBase (V3)
+
+  let armC = 0, armV = 0, ventaLista = false;
+  for (const nv of niveles) {
+    const e = Number(nv.estado);
+    if (e === 1) armC++;
+    else if (e === 2) { armV++; if (outVenta >= nv.minOutVenta) ventaLista = true; }
+  }
+  log.push(`  ${et}: niveles=${niveles.length} compraArm=${armC} ventaArm=${armV} pos=${R.posicionBase} outVenta=${outVenta} outCompra=${outCompra}${outVenta === 0n || outCompra === 0n ? ' ⚠ Quoter=0 (¿feeTier del bot ≠ 500?)' : ''}${ventaLista ? ' → VENTA LISTA' : ''}`);
 
   for (let i = 0; i < niveles.length; i++) {
     const estado = Number(niveles[i].estado);
