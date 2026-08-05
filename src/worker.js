@@ -52,7 +52,11 @@ const MAX_SCAN     = 14000; // bloques máximos a escanear por corrida (el resto
 // Solo lo que el keeper necesita del contrato.
 const ABI = [
   'function gasMinOp() view returns (uint256)',
-  'function resumen(address usuario, address base, address quote) view returns (tuple(address base,address quote,bool activa,uint256 niveles,uint256 armados,uint256 creadaEn,uint256 ultimaOpEn,uint256 comprasHechas,uint256 ventasHechas,uint256 ciclos,uint256 totalOps,uint256 posicionBase,uint256 costeQuote,uint256 volumenQuote,int256 gananciaQuote,uint256 gasSaldoWei,uint256 gasGastadoWei,uint256 ordenQuote,uint256 ordenBase,uint128 tpUnitOut,uint128 slUnitOut,uint16 slippageBps,uint32 cooldownSeg))',
+  'function resumen(address,address,address) view returns (tuple(address base,address quote,bool activa,uint256 niveles,uint256 armados,uint256 creadaEn,uint256 ultimaOpEn,uint256 comprasHechas,uint256 ventasHechas,uint256 ciclos,uint256 totalOps,uint256 posicionBase,uint256 costeQuote,uint256 volumenQuote,int256 gananciaQuote,uint256 gasSaldoWei,uint256 gasGastadoWei,uint256 ordenQuote,uint256 ordenBase,uint128 tpUnitOut,uint128 slUnitOut,uint16 slippageBps,uint32 cooldownSeg,uint24 feeTier))',
+  'function resumen(bytes32) view returns (tuple(address base,address quote,bool activa,uint256 niveles,uint256 armados,uint256 creadaEn,uint256 ultimaOpEn,uint256 comprasHechas,uint256 ventasHechas,uint256 ciclos,uint256 totalOps,uint256 posicionBase,uint256 costeQuote,uint256 volumenQuote,int256 gananciaQuote,uint256 gasSaldoWei,uint256 gasGastadoWei,uint256 ordenQuote,uint256 ordenBase,uint128 tpUnitOut,uint128 slUnitOut,uint16 slippageBps,uint32 cooldownSeg,uint24 feeTier))',
+  'function modoDe(bytes32) view returns (uint8 modo,uint16 objetivoBps)',
+  'function ejecutar(bytes32,uint256) external',
+  'function venderAcumulado(bytes32) external',
   'function nivelesDe(bytes32 k) view returns (tuple(uint128 minOutCompra,uint128 minOutVenta,uint8 estado)[])',
   'function pathsDe(bytes32 k) view returns (address[] compra, address[] venta)',
   'function ejecutar(address usuario, address base, address quote, uint256 i) external',
@@ -71,8 +75,10 @@ const QUOTER_ABI = [
 ];
 // Cuánto rinde `amountIn` de tokenIn en tokenOut por V3. Prueba los tiers en el mismo
 // orden que el frontend y usa el primero con liquidez (así coincide con el pool del bot).
-async function quoteV3(quoter, tokenIn, tokenOut, amountIn) {
-  for (const fee of FEE_TIERS) {
+async function quoteV3(quoter, tokenIn, tokenOut, amountIn, feeTier) {
+  const ft = Number(feeTier) || 0;
+  const tiers = ft ? [ft, ...FEE_TIERS.filter((t) => t !== ft)] : FEE_TIERS;
+  for (const fee of tiers) {
     try {
       const r = await quoter.quoteExactInputSingle.staticCall({ tokenIn, tokenOut, amountIn, fee, sqrtPriceLimitX96: 0n });
       if (r[0] > 0n) return r[0];
@@ -116,8 +122,11 @@ async function guardarEstado(env, estado) {
   await env.KEEPER_KV.put('estado', JSON.stringify(estado));
 }
 
+function claveDeG(g) {
+  return g.k || ethers.solidityPackedKeccak256(['address', 'address', 'address'], [g.u, g.b, g.q]);
+}
 function idGrid(g) {
-  return `${g.u}-${g.b}-${g.q}`.toLowerCase();
+  return claveDeG(g).toLowerCase();
 }
 
 /* ================================================================== */
@@ -143,7 +152,7 @@ async function descubrir(cRead, estado, latest, log) {
       break; // no avanzamos lastBlock más allá de lo escaneado
     }
     for (const ev of eventos) {
-      const g = { u: ev.args.usuario, b: ev.args.base, q: ev.args.quote };
+      const g = { u: ev.args.usuario, b: ev.args.base, q: ev.args.quote, k: ev.args.clave };
       const k = idGrid(g);
       if (!vistos.has(k)) {
         vistos.add(k);
@@ -163,22 +172,20 @@ async function descubrir(cRead, estado, latest, log) {
 
 async function procesarRejilla(cRead, cWrite, g, gasMin, log) {
   const et = `${g.b.slice(0, 6)}/${g.q.slice(0, 6)} de ${g.u.slice(0, 6)}`;
-  const R = await cRead.resumen(g.u, g.b, g.q);
+  const k = claveDeG(g);
+  const R = await cRead['resumen(bytes32)'](k);
   if (!R.activa) { log.push(`  ${et}: INACTIVA, salto`); return false; }
   if (R.gasSaldoWei < gasMin) { log.push(`  ${et}: SIN GAS (saldo ${R.gasSaldoWei} < min ${gasMin}) — recarga BNB al bot`); return false; }
-
-  const k = ethers.solidityPackedKeccak256(
-    ['address', 'address', 'address'], [g.u, g.b, g.q]
-  );
+  const feeTier = Number(R.feeTier) || 0;
   const quoter = new ethers.Contract(QUOTER_V3, QUOTER_ABI, cRead.runner);
 
   // Tipo de bot: 0 = cuadrícula · 1 = acumulador
   let modo = 0, objBps = 0n;
-  try { const md = await cRead.modoDe(g.u, g.b, g.q); modo = Number(md[0]); objBps = BigInt(md[1]); } catch (_) {}
+  try { const md = await cRead['modoDe(bytes32)'](k); modo = Number(md[0]); objBps = BigInt(md[1]); } catch (_) {}
 
   // 1) TP/SL primero: si se alcanzó, cierra toda la rejilla.
   if (R.tpUnitOut > 0n || R.slUnitOut > 0n) {
-    const precioVenta = await quoteV3(quoter, g.b, g.q, R.ordenBase);
+    const precioVenta = await quoteV3(quoter, g.b, g.q, R.ordenBase, feeTier);
     const tp = R.tpUnitOut > 0n && precioVenta >= R.tpUnitOut;
     const sl = R.slUnitOut > 0n && precioVenta <= R.slUnitOut;
     if (tp || sl) {
@@ -191,15 +198,15 @@ async function procesarRejilla(cRead, cWrite, g, gasMin, log) {
 
   // 2) Niveles: una cotización por dirección sirve para todos los niveles.
   const niveles = await cRead.nivelesDe(k);
-  const outCompra = await quoteV3(quoter, g.q, g.b, R.ordenQuote); // base que rinde ordenQuote (V3)
-  const outVenta  = await quoteV3(quoter, g.b, g.q, R.ordenBase);  // quote que rinde ordenBase (V3)
+  const outCompra = await quoteV3(quoter, g.q, g.b, R.ordenQuote, feeTier); // base que rinde ordenQuote (V3)
+  const outVenta  = await quoteV3(quoter, g.b, g.q, R.ordenBase, feeTier);  // quote que rinde ordenBase (V3)
 
   // ACUMULADOR: si la posición completa ya gana el objetivo, vende TODO de golpe.
   if (modo === 1 && R.posicionBase > 0n) {
-    const valor = await quoteV3(quoter, g.b, g.q, R.posicionBase);
+    const valor = await quoteV3(quoter, g.b, g.q, R.posicionBase, feeTier);
     const minObj = R.costeQuote * (10000n + objBps) / 10000n;
     if (valor > 0n && valor >= minObj) {
-      const tx = await cWrite.venderAcumulado(g.u, g.b, g.q);
+      const tx = await cWrite['venderAcumulado(bytes32)'](k);
       await tx.wait();
       log.push(`  ${et}: ACUMULADOR — VENTA TOTAL (valor ${valor} ≥ objetivo ${minObj}) tx ${tx.hash}`);
       return true;
@@ -217,7 +224,7 @@ async function procesarRejilla(cRead, cWrite, g, gasMin, log) {
   for (let i = 0; i < niveles.length; i++) {
     const estado = Number(niveles[i].estado);
     if (estado === 1 && outCompra >= niveles[i].minOutCompra) {
-      const tx = await cWrite.ejecutar(g.u, g.b, g.q, i);
+      const tx = await cWrite['ejecutar(bytes32,uint256)'](k, i);
       await tx.wait();
       log.push(`COMPRA nivel ${i} ${g.b}/${g.q} de ${g.u} tx ${tx.hash}`);
       return true;
@@ -229,7 +236,7 @@ async function procesarRejilla(cRead, cWrite, g, gasMin, log) {
         const costeOrden = R.costeQuote * R.ordenBase / R.posicionBase;
         if (outVenta < costeOrden) continue;
       }
-      const tx = await cWrite.ejecutar(g.u, g.b, g.q, i);
+      const tx = await cWrite['ejecutar(bytes32,uint256)'](k, i);
       await tx.wait();
       log.push(`VENTA${modo === 2 ? ' (Cash Out)' : ''} nivel ${i} ${g.b}/${g.q} de ${g.u} tx ${tx.hash}`);
       return true;
