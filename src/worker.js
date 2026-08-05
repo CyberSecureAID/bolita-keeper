@@ -217,15 +217,16 @@ async function procesarRejilla(cRead, cWrite, g, gasMin, log) {
       log.push(`COMPRA nivel ${i} ${g.b}/${g.q} de ${g.u} tx ${tx.hash}`);
       return true;
     }
-    if (modo === 0 && estado === 2 && outVenta >= niveles[i].minOutVenta) {
-      // Margen V6: no disparar si aún no cubre el coste promedio del tramo (evita revert).
-      if (R.posicionBase > 0n) {
+    if ((modo === 0 || modo === 2) && estado === 2 && outVenta >= niveles[i].minOutVenta) {
+      // Smart Grid (modo 0): no disparar si aún no cubre el coste promedio (evita revert).
+      // Cash Out (modo 2): vende directo al llegar al objetivo del usuario.
+      if (modo === 0 && R.posicionBase > 0n) {
         const costeOrden = R.costeQuote * R.ordenBase / R.posicionBase;
         if (outVenta < costeOrden) continue;
       }
       const tx = await cWrite.ejecutar(g.u, g.b, g.q, i);
       await tx.wait();
-      log.push(`VENTA nivel ${i} ${g.b}/${g.q} de ${g.u} tx ${tx.hash}`);
+      log.push(`VENTA${modo === 2 ? ' (Cash Out)' : ''} nivel ${i} ${g.b}/${g.q} de ${g.u} tx ${tx.hash}`);
       return true;
     }
   }
