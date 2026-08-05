@@ -52,11 +52,12 @@ const MAX_SCAN     = 14000; // bloques máximos a escanear por corrida (el resto
 // Solo lo que el keeper necesita del contrato.
 const ABI = [
   'function gasMinOp() view returns (uint256)',
-  'function resumen(address,address,address) view returns (tuple(address base,address quote,bool activa,uint256 niveles,uint256 armados,uint256 creadaEn,uint256 ultimaOpEn,uint256 comprasHechas,uint256 ventasHechas,uint256 ciclos,uint256 totalOps,uint256 posicionBase,uint256 costeQuote,uint256 volumenQuote,int256 gananciaQuote,uint256 gasSaldoWei,uint256 gasGastadoWei,uint256 ordenQuote,uint256 ordenBase,uint128 tpUnitOut,uint128 slUnitOut,uint16 slippageBps,uint32 cooldownSeg,uint24 feeTier))',
-  'function resumen(bytes32) view returns (tuple(address base,address quote,bool activa,uint256 niveles,uint256 armados,uint256 creadaEn,uint256 ultimaOpEn,uint256 comprasHechas,uint256 ventasHechas,uint256 ciclos,uint256 totalOps,uint256 posicionBase,uint256 costeQuote,uint256 volumenQuote,int256 gananciaQuote,uint256 gasSaldoWei,uint256 gasGastadoWei,uint256 ordenQuote,uint256 ordenBase,uint128 tpUnitOut,uint128 slUnitOut,uint16 slippageBps,uint32 cooldownSeg,uint24 feeTier))',
+  'function resumen(address,address,address) view returns (tuple(address base,address quote,bool activa,uint256 niveles,uint256 armados,uint256 creadaEn,uint256 ultimaOpEn,uint256 comprasHechas,uint256 ventasHechas,uint256 ciclos,uint256 totalOps,uint256 posicionBase,uint256 costeQuote,uint256 volumenQuote,int256 gananciaQuote,uint256 gasSaldoWei,uint256 gasGastadoWei,uint256 ordenQuote,uint256 ordenBase,uint128 tpUnitOut,uint128 slUnitOut,uint16 slippageBps,uint32 cooldownSeg,uint24 feeTier,uint256 intervalo,uint32 comprasMax))',
+  'function resumen(bytes32) view returns (tuple(address base,address quote,bool activa,uint256 niveles,uint256 armados,uint256 creadaEn,uint256 ultimaOpEn,uint256 comprasHechas,uint256 ventasHechas,uint256 ciclos,uint256 totalOps,uint256 posicionBase,uint256 costeQuote,uint256 volumenQuote,int256 gananciaQuote,uint256 gasSaldoWei,uint256 gasGastadoWei,uint256 ordenQuote,uint256 ordenBase,uint128 tpUnitOut,uint128 slUnitOut,uint16 slippageBps,uint32 cooldownSeg,uint24 feeTier,uint256 intervalo,uint32 comprasMax))',
   'function modoDe(bytes32) view returns (uint8 modo,uint16 objetivoBps)',
   'function ejecutar(bytes32,uint256) external',
   'function venderAcumulado(bytes32) external',
+  'function comprarDCA(bytes32) external',
   'function nivelesDe(bytes32 k) view returns (tuple(uint128 minOutCompra,uint128 minOutVenta,uint8 estado)[])',
   'function pathsDe(bytes32 k) view returns (address[] compra, address[] venta)',
   'function ejecutar(address usuario, address base, address quote, uint256 i) external',
@@ -182,6 +183,20 @@ async function procesarRejilla(cRead, cWrite, g, gasMin, log) {
   // Tipo de bot: 0 = cuadrícula · 1 = acumulador
   let modo = 0, objBps = 0n;
   try { const md = await cRead['modoDe(bytes32)'](k); modo = Number(md[0]); objBps = BigInt(md[1]); } catch (_) {}
+
+  // DCA (modo 3): dispara por TIEMPO. Compra cuando ya pasó el intervalo desde la última compra.
+  if (modo === 3) {
+    const ahora = BigInt(Math.floor(Date.now() / 1000));
+    const proxima = BigInt(R.ultimaOpEn) + BigInt(R.intervalo || 0n);
+    if (R.intervalo > 0n && ahora >= proxima) {
+      const tx = await cWrite['comprarDCA(bytes32)'](k);
+      await tx.wait();
+      log.push(`  ${et}: DCA — COMPRA #${Number(R.comprasHechas) + 1} tx ${tx.hash}`);
+      return true;
+    }
+    log.push(`  ${et}: DCA — próxima compra en ${Number(proxima - ahora)}s (compras ${Number(R.comprasHechas)}${R.comprasMax > 0n ? '/' + Number(R.comprasMax) : ''})`);
+    return false;
+  }
 
   // 1) TP/SL primero: si se alcanzó, cierra toda la rejilla.
   if (R.tpUnitOut > 0n || R.slUnitOut > 0n) {
