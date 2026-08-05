@@ -65,15 +65,20 @@ const ABI = [
 // PancakeSwap V3 QuoterV2: precio real del pool que usa el contrato (fee 0.05%).
 const QUOTER_V3 = '0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997';
 const FEE_V3    = 500;
+const FEE_TIERS = [500, 2500, 100, 10000];   // mismo orden que mejorFeeTier del front → mismo pool que el bot
 const QUOTER_ABI = [
   'function quoteExactInputSingle((address tokenIn,address tokenOut,uint256 amountIn,uint24 fee,uint160 sqrtPriceLimitX96)) returns (uint256 amountOut,uint160 sqrtPriceX96After,uint32 initializedTicksCrossed,uint256 gasEstimate)'
 ];
-// Cuánto rinde `amountIn` de tokenIn en tokenOut por V3. Devuelve 0 si no hay pool/liquidez.
+// Cuánto rinde `amountIn` de tokenIn en tokenOut por V3. Prueba los tiers en el mismo
+// orden que el frontend y usa el primero con liquidez (así coincide con el pool del bot).
 async function quoteV3(quoter, tokenIn, tokenOut, amountIn) {
-  try {
-    const r = await quoter.quoteExactInputSingle.staticCall({ tokenIn, tokenOut, amountIn, fee: FEE_V3, sqrtPriceLimitX96: 0n });
-    return r[0];
-  } catch { return 0n; }
+  for (const fee of FEE_TIERS) {
+    try {
+      const r = await quoter.quoteExactInputSingle.staticCall({ tokenIn, tokenOut, amountIn, fee, sqrtPriceLimitX96: 0n });
+      if (r[0] > 0n) return r[0];
+    } catch (_) {}
+  }
+  return 0n;
 }
 
 /* ================================================================== */
@@ -207,7 +212,7 @@ async function procesarRejilla(cRead, cWrite, g, gasMin, log) {
     if (e === 1) armC++;
     else if (e === 2) { armV++; if (outVenta >= nv.minOutVenta) ventaLista = true; }
   }
-  log.push(`  ${et}: niveles=${niveles.length} compraArm=${armC} ventaArm=${armV} pos=${R.posicionBase} outVenta=${outVenta} outCompra=${outCompra}${outVenta === 0n || outCompra === 0n ? ' ⚠ Quoter=0 (¿feeTier del bot ≠ 500?)' : ''}${ventaLista ? ' → VENTA LISTA' : ''}`);
+  log.push(`  ${et}: niveles=${niveles.length} compraArm=${armC} ventaArm=${armV} pos=${R.posicionBase} outVenta=${outVenta} outCompra=${outCompra}${outVenta === 0n || outCompra === 0n ? ' ⚠ Quoter=0 (no hay pool con liquidez en ningún tier)' : ''}${ventaLista ? ' → VENTA LISTA' : ''}`);
 
   for (let i = 0; i < niveles.length; i++) {
     const estado = Number(niveles[i].estado);
