@@ -87,6 +87,47 @@ const QUOTER_ABI = [
 /* Precio por PancakeSwap V2 (respaldo cuando V3 no responde). */
 const ROUTER_V2 = '0x10ED43C718714eb63d5aA57B78B54704E256024E';
 const ROUTER_V2_ABI = ['function getAmountsOut(uint256,address[]) view returns (uint256[])'];
+/* ══════════════════ MULTICALL ══════════════════
+   Una sola petición lee DECENAS de bots de golpe. Sin esto, cada bot costaba
+   ~6 peticiones y con 50 usuarios el keeper no daba abasto: Cloudflare corta
+   a las 50 peticiones por corrida. Con Multicall, 200 bots caben en 4.       */
+const MULTICALL3 = '0xcA11bde05977b3631167028862bE2a173976CA11';
+const MC_ABI = [
+  'function aggregate3(tuple(address target,bool allowFailure,bytes callData)[] calls) payable returns (tuple(bool success,bytes returnData)[])'
+];
+const iGrid = new ethers.Interface(ABI);
+const iQuoter = new ethers.Interface(QUOTER_ABI);
+
+/** Lanza muchas lecturas en UNA sola petición. Devuelve [{ok, datos}]. */
+async function lote(runner, llamadas) {
+  if (llamadas.length === 0) return [];
+  const mc = new ethers.Contract(MULTICALL3, MC_ABI, runner);
+  const salida = [];
+  // Troceamos para no mandar paquetes gigantes de una vez.
+  const TROZO = 150;   // cuantas más por paquete, más bots caben en una corrida
+  for (let i = 0; i < llamadas.length; i += TROZO) {
+    const trozo = llamadas.slice(i, i + TROZO);
+    if (!quedaMargen()) { trozo.forEach(() => salida.push({ ok: false })); continue; }
+    try {
+      gasto();
+      const res = await mc.aggregate3.staticCall(
+        trozo.map((c) => ({ target: c.target, allowFailure: true, callData: c.data }))
+      );
+      res.forEach((r, j) => {
+        if (!r.success) { salida.push({ ok: false }); return; }
+        try { salida.push({ ok: true, datos: trozo[j].iface.decodeFunctionResult(trozo[j].fn, r.returnData) }); }
+        catch (_) { salida.push({ ok: false }); }
+      });
+    } catch (e) {
+      trozo.forEach(() => salida.push({ ok: false }));
+    }
+  }
+  return salida;
+}
+
+const llGrid = (fn, args) => ({ target: GRIDBOT, data: iGrid.encodeFunctionData(fn, args), iface: iGrid, fn });
+const llQuoter = (params) => ({ target: QUOTER_V3, data: iQuoter.encodeFunctionData('quoteExactInputSingle', [params]), iface: iQuoter, fn: 'quoteExactInputSingle' });
+
 async function quoteV2(runner, tokenIn, tokenOut, amountIn) {
   try {
     const r = new ethers.Contract(ROUTER_V2, ROUTER_V2_ABI, runner);
@@ -131,7 +172,7 @@ async function getProvider() {
 /* Memoria (KV): bloque escaneado + lista de rejillas                  */
 /* ================================================================== */
 
-const VACIO = () => ({ lastBlock: 0, grids: [], usuarios: [] });
+const VACIO = () => ({ lastBlock: 0, grids: [], usuarios: [], descartadas: [] });
 
 async function cargarEstado(env) {
   if (!env.KEEPER_KV) return VACIO();
@@ -144,6 +185,7 @@ async function cargarEstado(env) {
       grids: Array.isArray(e.grids) ? e.grids : [],
       // OJO: sin esta línea se perdía la lista de cuentas en cada corrida.
       usuarios: Array.isArray(e.usuarios) ? e.usuarios : [],
+      descartadas: Array.isArray(e.descartadas) ? e.descartadas : [],
       turno: Number(e.turno) || 0
     };
   } catch (_) { return VACIO(); }
@@ -171,32 +213,44 @@ function idGrid(g) {
    La lista de usuarios se guarda en el KV y la web la va alimentando. */
 async function descubrirPorUsuarios(cRead, estado, log) {
   if (!Array.isArray(estado.usuarios)) estado.usuarios = [];
-  if (estado.usuarios.length === 0) { log.push('no hay usuarios vigilados todavía'); return; }
+  if (!Array.isArray(estado.descartadas)) estado.descartadas = [];
+  if (estado.usuarios.length === 0) { log.push('no hay cuentas vigiladas todavía'); return; }
 
-  const vistos = new Set(estado.grids.map(idGrid));
+  // 1) Las claves de cada cuenta, todas en UNA petición.
+  const res = await lote(cRead.runner, estado.usuarios.map((u) => llGrid('misRejillas', [u])));
+  const porUsuario = [];
+  res.forEach((r, i) => { if (r.ok) porUsuario.push({ u: estado.usuarios[i], claves: r.datos[0] }); });
+
   const conocidas = new Set(estado.grids.map((g) => String(claveDeG(g)).toLowerCase()));
-  for (const u of estado.usuarios) {
-    if (!quedaMargen(3)) { log.push('sin presupuesto para buscar bots nuevos; sigo en la próxima'); break; }
-    let claves = [];
-    try { gasto(); claves = await cRead.misRejillas(u); }
-    catch (e) { log.push(`no pude leer los bots de ${u.slice(0, 8)}: ${e?.shortMessage || e?.message || e}`); continue; }
+  const descartadas = new Set(estado.descartadas.map((x) => String(x).toLowerCase()));
+
+  // 2) Solo las que no conocemos NI hemos descartado antes.
+  const nuevas = [];
+  for (const { u, claves } of porUsuario) {
     for (const k of claves) {
-      // Si ya la conocemos, ni la consultamos: ahorra una petición por bot.
-      if (conocidas.has(String(k).toLowerCase())) continue;
-      if (!quedaMargen(2)) { log.push('sigo buscando bots nuevos en la próxima corrida'); break; }
-      try {
-        gasto();
-        gasto(); const R = await cRead['resumen(bytes32)'](k);
-        if (!R.activa) continue;                       // cancelado o terminado
-        const g = { u, b: R.base, q: R.quote, k };
-        const id = idGrid(g);
-        if (vistos.has(id)) continue;
-        vistos.add(id); conocidas.add(String(k).toLowerCase());
-        estado.grids.push(g);
-        log.push(`bot NUEVO encontrado: ${R.base.slice(0, 8)}/${R.quote.slice(0, 8)} de ${u.slice(0, 8)}`);
-      } catch (_) {}
+      const kk = String(k).toLowerCase();
+      if (conocidas.has(kk) || descartadas.has(kk)) continue;
+      nuevas.push({ u, k });
     }
   }
+  if (nuevas.length === 0) { log.push('sin bots nuevos'); return; }
+
+  // 3) Su estado, también en UNA petición (antes era una por bot: se comía todo).
+  const rs = await lote(cRead.runner, nuevas.map((x) => llGrid('resumen(bytes32)', [x.k])));
+  let alta = 0;
+  rs.forEach((r, i) => {
+    const { u, k } = nuevas[i];
+    if (!r.ok) return;
+    const R = r.datos[0];
+    if (!R.activa) { estado.descartadas.push(String(k).toLowerCase()); return; }  // no volver a mirarla
+    const g = { u, b: R.base, q: R.quote, k };
+    if (conocidas.has(String(k).toLowerCase())) return;
+    conocidas.add(String(k).toLowerCase());
+    estado.grids.push(g); alta++;
+  });
+  // La lista de descartadas no crece sin límite.
+  if (estado.descartadas.length > 400) estado.descartadas = estado.descartadas.slice(-400);
+  if (alta) log.push(`${alta} bot(s) nuevo(s) en vigilancia`);
 }
 
 async function descubrir(cRead, estado, latest, log) {
@@ -251,112 +305,79 @@ async function descubrir(cRead, estado, latest, log) {
 /* Procesar una rejilla                                                */
 /* ================================================================== */
 
-async function procesarRejilla(cRead, cWrite, g, gasMin, log) {
-  const et = `${g.b.slice(0, 6)}/${g.q.slice(0, 6)} de ${g.u.slice(0, 6)}`;
-  const k = claveDeG(g);
-  const R = await cRead['resumen(bytes32)'](k);
-  if (!R.activa) { log.push(`  ${et}: INACTIVA, salto`); return false; }
-  if (R.gasSaldoWei < gasMin) { log.push(`  ${et}: SIN GAS (saldo ${R.gasSaldoWei} < min ${gasMin}) — recarga BNB al bot`); return false; }
-  const feeTier = Number(R.feeTier) || 0;
-  const quoter = new ethers.Contract(QUOTER_V3, QUOTER_ABI, cRead.runner);
-
-  // Tipo de bot: 0 = cuadrícula · 1 = acumulador
-  let modo = 0, objBps = 0n;
-  // El tipo de bot no cambia nunca: lo guardamos y no lo volvemos a pedir.
-  if (g.modo === undefined) {
-    try { gasto(); const md = await cRead['modoDe(bytes32)'](k); g.modo = Number(md[0]); g.obj = String(md[1]); } catch (_) {}
-  }
-  modo = Number(g.modo || 0); objBps = BigInt(g.obj || 0);
-
-  // DCA (modo 3): dispara por TIEMPO. Compra cuando ya pasó el intervalo desde la última compra.
-  if (modo === 3) {
-    const ahora = BigInt(Math.floor(Date.now() / 1000));
-    const proxima = BigInt(R.ultimaOpEn) + BigInt(R.intervalo || 0n);
-    if (R.intervalo > 0n && ahora >= proxima) {
-      const tx = await cWrite['comprarDCA(bytes32)'](k);
-      await tx.wait();
-      log.push(`  ${et}: DCA — COMPRA #${Number(R.comprasHechas) + 1} tx ${tx.hash}`);
-      return true;
-    }
-    log.push(`  ${et}: DCA — próxima compra en ${Number(proxima - ahora)}s (compras ${Number(R.comprasHechas)}${R.comprasMax > 0n ? '/' + Number(R.comprasMax) : ''})`);
-    return false;
-  }
-
-  // 1) TP/SL primero: si se alcanzó, cierra toda la rejilla.
-  if (R.tpUnitOut > 0n || R.slUnitOut > 0n) {
-    let precioVenta = await quoteV3(quoter, g.b, g.q, R.ordenBase, feeTier);
-    // Respaldo por V2: si V3 no cotiza (pool sin liquidez o inexistente),
-    // preguntamos a V2 para no quedarnos con un precio de cero, que nunca
-    // alcanzaría el objetivo y dejaría el bot sin vender jamás.
-    if (precioVenta === 0n) {
-      precioVenta = await quoteV2(cRead.runner, g.b, g.q, R.ordenBase);
-      if (precioVenta > 0n) log.push(`  ${et}: V3 no cotiza, uso V2`);
-    }
-    // Dejamos constancia de los números, para poder ver por qué entra o no.
-    log.push(`  ${et}: TP/SL — precio=${precioVenta} tp=${R.tpUnitOut} sl=${R.slUnitOut} ordenBase=${R.ordenBase} feeTier=${feeTier}`);
-    const tp = R.tpUnitOut > 0n && precioVenta >= R.tpUnitOut;
-    const sl = R.slUnitOut > 0n && precioVenta <= R.slUnitOut;
-    if (tp || sl) {
-      const tx = await cWrite.cerrarPorTPSL(g.u, g.b, g.q);
-      await tx.wait();
-      log.push(`CIERRE ${tp ? 'TP' : 'SL'} ${g.b}/${g.q} de ${g.u} tx ${tx.hash}`);
-      return true;
-    }
-  }
-
-  // 2) Niveles: una cotización por dirección sirve para todos los niveles.
-  if (!quedaMargen(3)) { log.push(`  ${et}: sin presupuesto, sigo en la próxima corrida`); return false; }
-  gasto(); const niveles = await cRead.nivelesDe(k);
-  const outCompra = await quoteV3(quoter, g.q, g.b, R.ordenQuote, feeTier); // base que rinde ordenQuote (V3)
-  const outVenta  = await quoteV3(quoter, g.b, g.q, R.ordenBase, feeTier);  // quote que rinde ordenBase (V3)
-
-  // ACUMULADOR: si la posición completa ya gana el objetivo, vende TODO de golpe.
-  if (modo === 1 && R.posicionBase > 0n) {
-    const valor = await quoteV3(quoter, g.b, g.q, R.posicionBase, feeTier);
-    const minObj = R.costeQuote * (10000n + objBps) / 10000n;
-    if (valor > 0n && valor >= minObj) {
-      const tx = await cWrite['venderAcumulado(bytes32)'](k);
-      await tx.wait();
-      log.push(`  ${et}: ACUMULADOR — VENTA TOTAL (valor ${valor} ≥ objetivo ${minObj}) tx ${tx.hash}`);
-      return true;
-    }
-  }
-
-  let armC = 0, armV = 0, ventaLista = false;
-  for (const nv of niveles) {
-    const e = Number(nv.estado);
-    if (e === 1) armC++;
-    else if (e === 2) { armV++; if (outVenta >= nv.minOutVenta) ventaLista = true; }
-  }
-  log.push(`  ${et}: niveles=${niveles.length} compraArm=${armC} ventaArm=${armV} pos=${R.posicionBase} outVenta=${outVenta} outCompra=${outCompra}${outVenta === 0n || outCompra === 0n ? ' ⚠ Quoter=0 (no hay pool con liquidez en ningún tier)' : ''}${ventaLista ? ' → VENTA LISTA' : ''}`);
-
-  for (let i = 0; i < niveles.length; i++) {
-    const estado = Number(niveles[i].estado);
-    if (estado === 1 && outCompra >= niveles[i].minOutCompra) {
-      const tx = await cWrite['ejecutar(bytes32,uint256)'](k, i);
-      await tx.wait();
-      log.push(`COMPRA nivel ${i} ${g.b}/${g.q} de ${g.u} tx ${tx.hash}`);
-      return true;
-    }
-    if ((modo === 0 || modo === 2) && estado === 2 && outVenta >= niveles[i].minOutVenta) {
-      // Smart Grid (modo 0): no disparar si aún no cubre el coste promedio (evita revert).
-      // Cash Out (modo 2): vende directo al llegar al objetivo del usuario.
-      if (modo === 0 && R.posicionBase > 0n) {
-        const costeOrden = R.costeQuote * R.ordenBase / R.posicionBase;
-        if (outVenta < costeOrden) continue;
-      }
-      const tx = await cWrite['ejecutar(bytes32,uint256)'](k, i);
-      await tx.wait();
-      log.push(`VENTA${modo === 2 ? ' (Cash Out)' : ''} nivel ${i} ${g.b}/${g.q} de ${g.u} tx ${tx.hash}`);
-      return true;
-    }
-  }
-  return false;
-}
 
 /* ================================================================== */
 /* Corrida principal                                                   */
 /* ================================================================== */
+
+/** Decide qué hacer con un bot. Ya tiene TODOS los datos leídos: aquí no se
+ *  gasta ni una petición salvo que haya que ejecutar de verdad. */
+async function decidir(cWrite, b, gasMin, log, et) {
+  const { g, R, modo, obj, niveles } = b;
+  const k = claveDeG(g);
+
+  if (R.gasSaldoWei < gasMin) { log.push(`  ${et}: SIN GAS — el usuario debe recargar BNB`); return false; }
+
+  // DCA: dispara por tiempo.
+  if (modo === 3) {
+    const ahora = BigInt(Math.floor(Date.now() / 1000));
+    const proxima = BigInt(R.ultimaOpEn) + BigInt(R.intervalo || 0n);
+    if (R.intervalo > 0n && ahora >= proxima) {
+      gasto(2); const tx = await cWrite['comprarDCA(bytes32)'](k); await tx.wait();
+      log.push(`  ${et}: DCA — COMPRA #${Number(R.comprasHechas) + 1}`);
+      return true;
+    }
+    log.push(`  ${et}: DCA — faltan ${Number(proxima - ahora)}s`);
+    return false;
+  }
+
+  // Take Profit / Stop Loss: cierra la posición entera.
+  if (R.tpUnitOut > 0n || R.slUnitOut > 0n) {
+    const tp = R.tpUnitOut > 0n && b.outVenta >= R.tpUnitOut;
+    const sl = R.slUnitOut > 0n && b.outVenta > 0n && b.outVenta <= R.slUnitOut;
+    log.push(`  ${et}: TP/SL — precio=${b.outVenta} tp=${R.tpUnitOut} sl=${R.slUnitOut}${tp ? ' ¡ALCANZADO!' : ''}`);
+    if (tp || sl) {
+      gasto(2); const tx = await cWrite.cerrarPorTPSL(g.u, g.b, g.q); await tx.wait();
+      log.push(`  ${et}: CIERRE por ${tp ? 'TAKE PROFIT' : 'STOP LOSS'} · tx ${tx.hash}`);
+      return true;
+    }
+  }
+
+  // Acumulador: vende todo cuando la posición completa alcanza el objetivo.
+  if (modo === 1 && R.posicionBase > 0n) {
+    const minObj = R.costeQuote * (10000n + obj) / 10000n;
+    log.push(`  ${et}: ACUM — valor=${b.valorPos} objetivo=${minObj}`);
+    if (b.valorPos > 0n && b.valorPos >= minObj) {
+      gasto(2); const tx = await cWrite['venderAcumulado(bytes32)'](k); await tx.wait();
+      log.push(`  ${et}: ACUMULADOR — VENTA TOTAL · tx ${tx.hash}`);
+      return true;
+    }
+  }
+
+  // Cuadrículas: la primera que toque.
+  let armC = 0, armV = 0;
+  for (let i = 0; i < niveles.length; i++) {
+    const nv = niveles[i];
+    const e = Number(nv.estado);
+    if (e === 1) {
+      armC++;
+      if (b.outCompra > 0n && b.outCompra >= BigInt(nv.minOutCompra)) {
+        gasto(2); const tx = await cWrite['ejecutar(bytes32,uint256)'](k, i); await tx.wait();
+        log.push(`  ${et}: COMPRA nivel ${i} · tx ${tx.hash}`);
+        return true;
+      }
+    } else if (e === 2) {
+      armV++;
+      if (b.outVenta > 0n && b.outVenta >= BigInt(nv.minOutVenta)) {
+        gasto(2); const tx = await cWrite['ejecutar(bytes32,uint256)'](k, i); await tx.wait();
+        log.push(`  ${et}: VENTA nivel ${i} · tx ${tx.hash}`);
+        return true;
+      }
+    }
+  }
+  log.push(`  ${et}: niveles=${niveles.length} compras armadas=${armC} ventas armadas=${armV} outVenta=${b.outVenta} outCompra=${b.outCompra}`);
+  return false;
+}
 
 async function correr(env, log) {
   _peticiones = 0;
@@ -381,29 +402,61 @@ async function correr(env, log) {
   // ("limit exceeded"), por eso vamos por la vía directa de arriba.
   estado.lastBlock = latest;
 
-  let gasMin = 0n;
-  try { gasMin = await cRead.gasMinOp(); } catch (_) {}
-
-  // Repartimos por turnos: si no caben todos, seguimos por donde nos quedamos.
-  // Así ningún bot se queda sin revisar nunca (antes los últimos nunca entraban).
   const total = estado.grids.length;
-  const inicio = total ? (Number(estado.turno || 0) % total) : 0;
-  const orden = estado.grids.slice(inicio).concat(estado.grids.slice(0, inicio));
-  let revisados = 0;
+  let revisados = 0, acciones = 0;
 
-  let acciones = 0;
-  for (const g of orden) {
-    if (!quedaMargen(6)) { log.push(`me quedo sin presupuesto: sigo con el resto en la próxima corrida`); break; }
-    revisados++;
-    if (acciones >= MAX_ACCIONES) break;
-    try {
-      if (await procesarRejilla(cRead, cWrite, g, gasMin, log)) acciones++;
-    } catch (e) {
-      log.push(`rejilla ${g.b}/${g.q} de ${g.u}: ${e?.shortMessage || e?.message || e}`);
+  if (total > 0) {
+    // ── TODO de una vez: estado, tipo y niveles de CADA bot en pocas peticiones ──
+    const lecturas = [llGrid('gasMinOp', [])];
+    for (const g of estado.grids) {
+      const k = claveDeG(g);
+      lecturas.push(llGrid('resumen(bytes32)', [k]));
+      lecturas.push(llGrid('modoDe(bytes32)', [k]));
+      lecturas.push(llGrid('nivelesDe', [k]));
     }
+    const r1 = await lote(cRead.runner, lecturas);
+    const gasMin = r1[0]?.ok ? r1[0].datos[0] : 0n;
+
+    const bots = [];
+    estado.grids.forEach((g, i) => {
+      const base = 1 + i * 3;
+      const R = r1[base]?.ok ? r1[base].datos[0] : null;
+      const md = r1[base + 1]?.ok ? r1[base + 1].datos : null;
+      const nv = r1[base + 2]?.ok ? r1[base + 2].datos[0] : null;
+      if (R) bots.push({ g, R, modo: md ? Number(md[0]) : 0, obj: md ? BigInt(md[1]) : 0n, niveles: nv || [] });
+    });
+
+    // ── Los precios de todos los pares, también de una vez ──
+    const cotiz = [];
+    for (const b of bots) {
+      const ft = Number(b.R.feeTier) || 500;
+      cotiz.push(llQuoter({ tokenIn: b.g.b, tokenOut: b.g.q, amountIn: b.R.ordenBase, fee: ft, sqrtPriceLimitX96: 0n }));
+      cotiz.push(llQuoter({ tokenIn: b.g.q, tokenOut: b.g.b, amountIn: b.R.ordenQuote, fee: ft, sqrtPriceLimitX96: 0n }));
+      cotiz.push(llQuoter({ tokenIn: b.g.b, tokenOut: b.g.q, amountIn: b.R.posicionBase > 0n ? b.R.posicionBase : 1n, fee: ft, sqrtPriceLimitX96: 0n }));
+    }
+    const r2 = await lote(cRead.runner, cotiz);
+    bots.forEach((b, i) => {
+      b.outVenta = r2[i * 3]?.ok ? r2[i * 3].datos[0] : 0n;
+      b.outCompra = r2[i * 3 + 1]?.ok ? r2[i * 3 + 1].datos[0] : 0n;
+      b.valorPos = r2[i * 3 + 2]?.ok ? r2[i * 3 + 2].datos[0] : 0n;
+    });
+
+    // ── Ahora decidimos, sin gastar ni una petición más ──
+    const vivos = [];
+    for (const b of bots) {
+      revisados++;
+      const et = `${b.g.b.slice(0, 6)}/${b.g.q.slice(0, 6)}`;
+      if (!b.R.activa) { log.push(`  ${et}: terminada, fuera de la lista`); continue; }
+      vivos.push(b.g);
+      if (acciones >= MAX_ACCIONES) continue;
+      try {
+        const hizo = await decidir(cWrite, b, gasMin, log, et);
+        if (hizo) acciones++;
+      } catch (e) { log.push(`  ⚠ ${et}: ${e?.shortMessage || e?.reason || e?.message || e}`); }
+    }
+    estado.grids = vivos;
   }
 
-  estado.turno = total ? ((inicio + revisados) % total) : 0;
   await guardarEstado(env, estado);
   log.push(`corrida ok: ${revisados}/${total} rejillas revisadas · ${acciones} acciones · ${_peticiones} peticiones`);
   // Guardamos el informe para poder verlo desde el navegador (/estado)
