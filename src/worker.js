@@ -92,6 +92,13 @@ const ROUTER_V2_ABI = ['function getAmountsOut(uint256,address[]) view returns (
    ~6 peticiones y con 50 usuarios el keeper no daba abasto: Cloudflare corta
    a las 50 peticiones por corrida. Con Multicall, 200 bots caben en 4.       */
 const MULTICALL3 = '0xcA11bde05977b3631167028862bE2a173976CA11';
+/* ══════════════════ REPARTO EN TURNOS PARALELOS ══════════════════
+   Un solo Worker aguanta ~600 bots por corrida. Para miles de usuarios,
+   la corrida principal NO trabaja: reparte el trabajo llamando a varias
+   copias de sí misma, y cada copia atiende su parte con presupuesto propio.
+   Así crecemos sin tocar nada más: solo sube el número de partes.        */
+const BOTS_POR_PARTE = 400;      // cuántos bots atiende cada copia
+const MAX_PARTES = 30;           // techo de seguridad (30 × 400 = 12.000 bots)
 const MC_ABI = [
   'function aggregate3(tuple(address target,bool allowFailure,bytes callData)[] calls) payable returns (tuple(bool success,bytes returnData)[])'
 ];
@@ -379,12 +386,53 @@ async function decidir(cWrite, b, gasMin, log, et) {
   return false;
 }
 
-async function correr(env, log) {
+/** Corrida principal: NO trabaja, reparte.
+ *  Mira cuántos bots hay y llama a tantas copias como haga falta, en paralelo.
+ *  Cada copia atiende su parte con su propio presupuesto de peticiones. */
+async function repartir(env, log) {
+  const estado = await cargarEstado(env);
+  const total = estado.grids.length;
+  const partes = Math.max(1, Math.min(MAX_PARTES, Math.ceil(total / BOTS_POR_PARTE)));
+
+  // Con pocos bots no hace falta repartir: lo hacemos aquí y ahorramos.
+  if (partes === 1) { await correr(env, log, 0, 1); return; }
+
+  log.push(`${total} bots → los reparto en ${partes} partes`);
+  const base = (env.KEEPER_URL || '').replace(/\/$/, '');
+  if (!base) {
+    log.push('falta KEEPER_URL: hago lo que pueda en una sola corrida');
+    await correr(env, log, 0, 1);
+    return;
+  }
+  const clave = env.ADMIN_TOKEN || '';
+  const tareas = [];
+  for (let i = 0; i < partes; i++) {
+    tareas.push(fetch(`${base}/parte?n=${i}&de=${partes}&key=${encodeURIComponent(clave)}`)
+      .then((r) => r.text()).catch((e) => 'parte ' + i + ' falló: ' + e));
+  }
+  const res = await Promise.all(tareas);
+  log.push(...res.map((t, i) => `parte ${i}: ${String(t).slice(0, 90)}`));
+
+  // Un resumen para /estado
+  try {
+    if (env.KEEPER_KV) await env.KEEPER_KV.put('ultimo', JSON.stringify({
+      cuando: new Date().toISOString(), bloque: 0, lastBlock: 0,
+      rejillas: total, usuarios: (estado.usuarios || []).length,
+      revisados: total, peticiones: partes, acciones: 0,
+      log: [`repartido en ${partes} partes de hasta ${BOTS_POR_PARTE} bots`, ...res.map((t, i) => `parte ${i}: ${String(t).slice(0, 90)}`)]
+    }));
+  } catch (_) {}
+}
+
+async function correr(env, log, parte = 0, departes = 1) {
   _peticiones = 0;
   if (!env.KEEPER_PRIVATE_KEY) { log.push('falta KEEPER_PRIVATE_KEY'); return; }
 
   const provider = await getProvider();
-  const wallet   = new ethers.Wallet(env.KEEPER_PRIVATE_KEY, provider);
+  // Varias llaves separadas por comas: cada parte usa la suya, así las
+  // transacciones no hacen cola detrás de una sola wallet.
+  const llaves = String(env.KEEPER_PRIVATE_KEY).split(',').map((x) => x.trim()).filter(Boolean);
+  const wallet   = new ethers.Wallet(llaves[parte % llaves.length] || llaves[0], provider);
   const cRead    = new ethers.Contract(GRIDBOT, ABI, provider);
   const cWrite   = new ethers.Contract(GRIDBOT, ABI, wallet);
 
@@ -402,13 +450,16 @@ async function correr(env, log) {
   // ("limit exceeded"), por eso vamos por la vía directa de arriba.
   estado.lastBlock = latest;
 
-  const total = estado.grids.length;
+  // Cada copia atiende solo los bots que le tocan.
+  const todos = estado.grids;
+  const mios = departes > 1 ? todos.filter((_, i) => (i % departes) === parte) : todos;
+  const total = mios.length;
   let revisados = 0, acciones = 0;
 
   if (total > 0) {
     // ── TODO de una vez: estado, tipo y niveles de CADA bot en pocas peticiones ──
     const lecturas = [llGrid('gasMinOp', [])];
-    for (const g of estado.grids) {
+    for (const g of mios) {
       const k = claveDeG(g);
       lecturas.push(llGrid('resumen(bytes32)', [k]));
       lecturas.push(llGrid('modoDe(bytes32)', [k]));
@@ -418,7 +469,7 @@ async function correr(env, log) {
     const gasMin = r1[0]?.ok ? r1[0].datos[0] : 0n;
 
     const bots = [];
-    estado.grids.forEach((g, i) => {
+    mios.forEach((g, i) => {
       const base = 1 + i * 3;
       const R = r1[base]?.ok ? r1[base].datos[0] : null;
       const md = r1[base + 1]?.ok ? r1[base + 1].datos : null;
@@ -454,7 +505,13 @@ async function correr(env, log) {
         if (hizo) acciones++;
       } catch (e) { log.push(`  ⚠ ${et}: ${e?.shortMessage || e?.reason || e?.message || e}`); }
     }
-    estado.grids = vivos;
+    // Solo quitamos de la lista los bots de NUESTRA parte que ya terminaron.
+    if (departes > 1) {
+      const muertos = new Set(mios.filter((g) => !vivos.includes(g)).map(idGrid));
+      estado.grids = todos.filter((g) => !muertos.has(idGrid(g)));
+    } else {
+      estado.grids = vivos;
+    }
   }
 
   await guardarEstado(env, estado);
@@ -481,7 +538,7 @@ async function correr(env, log) {
 export default {
   async scheduled(event, env, ctx) {
     const log = [];
-    try { await correr(env, log); }
+    try { await repartir(env, log); }
     catch (e) { log.push('ERROR: ' + (e?.message || e)); }
     console.log(log.join('\n'));
   },
@@ -489,6 +546,19 @@ export default {
   // Disparo/diagnóstico manual:  https://tu-worker.workers.dev/run?key=TU_ADMIN_TOKEN
   async fetch(req, env) {
     const url = new URL(req.url);
+
+    // Cada copia atiende su parte del trabajo (la llama la corrida principal).
+    if (url.pathname === '/parte') {
+      if (env.ADMIN_TOKEN && url.searchParams.get('key') !== env.ADMIN_TOKEN) {
+        return new Response('no autorizado', { status: 401 });
+      }
+      const nParte = Math.max(0, parseInt(url.searchParams.get('n') || '0', 10));
+      const deTotal = Math.max(1, parseInt(url.searchParams.get('de') || '1', 10));
+      const log = [];
+      try { await correr(env, log, nParte, deTotal); }
+      catch (e) { log.push('ERROR: ' + (e?.message || e)); }
+      return new Response(log.slice(-6).join(' | '), { status: 200 });
+    }
 
     // Página de estado: mira aquí para saber si el keeper trabaja.
     if (url.pathname === '/estado') {
