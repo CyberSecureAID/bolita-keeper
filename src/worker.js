@@ -109,14 +109,21 @@ async function getProvider() {
 /* Memoria (KV): bloque escaneado + lista de rejillas                  */
 /* ================================================================== */
 
+const VACIO = () => ({ lastBlock: 0, grids: [], usuarios: [] });
+
 async function cargarEstado(env) {
-  if (!env.KEEPER_KV) return { lastBlock: 0, grids: [] };
+  if (!env.KEEPER_KV) return VACIO();
   const raw = await env.KEEPER_KV.get('estado');
-  if (!raw) return { lastBlock: 0, grids: [] };
+  if (!raw) return VACIO();
   try {
     const e = JSON.parse(raw);
-    return { lastBlock: e.lastBlock || 0, grids: Array.isArray(e.grids) ? e.grids : [] };
-  } catch (_) { return { lastBlock: 0, grids: [] }; }
+    return {
+      lastBlock: e.lastBlock || 0,
+      grids: Array.isArray(e.grids) ? e.grids : [],
+      // OJO: sin esta línea se perdía la lista de cuentas en cada corrida.
+      usuarios: Array.isArray(e.usuarios) ? e.usuarios : []
+    };
+  } catch (_) { return VACIO(); }
 }
 
 async function guardarEstado(env, estado) {
@@ -333,8 +340,9 @@ async function correr(env, log) {
 
   // 1) Preguntar por los usuarios vigilados (fiable, no depende de eventos).
   await descubrirPorUsuarios(cRead, estado, log);
-  // 2) Y de paso, intentar hallar bots nuevos por eventos (si el servidor deja).
-  try { await descubrir(cRead, estado, latest, log); } catch (e) { log.push('descubrir por eventos no disponible'); }
+  // Nota: buscar por eventos no funciona en los servidores públicos de BSC
+  // ("limit exceeded"), por eso vamos por la vía directa de arriba.
+  estado.lastBlock = latest;
 
   let gasMin = 0n;
   try { gasMin = await cRead.gasMinOp(); } catch (_) {}
