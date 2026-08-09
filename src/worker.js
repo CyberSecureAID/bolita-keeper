@@ -365,7 +365,8 @@ async function decidir(cWrite, b, gasMin, log, et) {
   if (R.tpUnitOut > 0n || R.slUnitOut > 0n) {
     const tp = R.tpUnitOut > 0n && b.outVenta >= R.tpUnitOut;
     const sl = R.slUnitOut > 0n && b.outVenta > 0n && b.outVenta <= R.slUnitOut;
-    log.push(`  ${et}: TP/SL — precio=${b.outVenta} tp=${R.tpUnitOut} sl=${R.slUnitOut}${tp ? ' ¡ALCANZADO!' : ''}`);
+    const faltaTP = R.tpUnitOut > 0n && b.outVenta > 0n ? Number((BigInt(R.tpUnitOut) - b.outVenta) * 10000n / BigInt(R.tpUnitOut)) / 100 : null;
+    log.push(`  ${et}: TAKE PROFIT — ${tp ? '¡ALCANZADO! vendiendo' : faltaTP === null ? 'esperando' : `falta ${faltaTP.toFixed(2)}% de subida`}${sl ? ' · STOP LOSS alcanzado' : ''}`);
     if (tp || sl) {
       return await ejecutarSeguro(cWrite, 'cerrarPorTPSL', [g.u, g.b, g.q], log, et, `cierre por ${tp ? 'TAKE PROFIT' : 'STOP LOSS'}`);
     }
@@ -374,7 +375,8 @@ async function decidir(cWrite, b, gasMin, log, et) {
   // Acumulador: vende todo cuando la posición completa alcanza el objetivo.
   if (modo === 1 && R.posicionBase > 0n) {
     const minObj = R.costeQuote * (10000n + obj) / 10000n;
-    log.push(`  ${et}: ACUM — valor=${b.valorPos} objetivo=${minObj}`);
+    const faltaA = minObj > 0n && b.valorPos > 0n ? Number((minObj - b.valorPos) * 10000n / minObj) / 100 : null;
+    log.push(`  ${et}: ACUMULADOR — ${faltaA === null ? 'sin datos' : faltaA <= 0 ? '¡objetivo alcanzado!' : `falta ${faltaA.toFixed(2)}% para vender todo`}`);
     if (b.valorPos > 0n && b.valorPos >= minObj) {
       return await ejecutarSeguro(cWrite, 'venderAcumulado(bytes32)', [k], log, et, 'venta total del acumulador');
     }
@@ -397,7 +399,28 @@ async function decidir(cWrite, b, gasMin, log, et) {
       }
     }
   }
-  log.push(`  ${et}: niveles=${niveles.length} compras armadas=${armC} ventas armadas=${armV} outVenta=${b.outVenta} outCompra=${b.outCompra}`);
+  // Cuánto le falta a la cuadrícula más cercana. Así se ve de un vistazo si
+  // el bot está "a punto" o muy lejos, en vez de números sueltos.
+  const dist = (actual, objetivo) => {
+    if (!(objetivo > 0n) || !(actual > 0n)) return null;
+    const pct = Number((objetivo - actual) * 10000n / objetivo) / 100;
+    return pct;
+  };
+  let cercaV = null, cercaC = null;
+  for (const nv of niveles) {
+    const e = Number(nv.estado);
+    if (e === 2 && BigInt(nv.minOutVenta) > 0n) {
+      const d = dist(b.outVenta, BigInt(nv.minOutVenta));
+      if (d !== null && (cercaV === null || d < cercaV)) cercaV = d;
+    }
+    if (e === 1 && BigInt(nv.minOutCompra) > 0n) {
+      const d = dist(b.outCompra, BigInt(nv.minOutCompra));
+      if (d !== null && (cercaC === null || d < cercaC)) cercaC = d;
+    }
+  }
+  const txtV = cercaV === null ? '—' : (cercaV <= 0 ? '¡lista!' : `falta ${cercaV.toFixed(2)}% de subida`);
+  const txtC = cercaC === null ? '—' : (cercaC <= 0 ? '¡lista!' : `falta ${cercaC.toFixed(2)}% de bajada`);
+  log.push(`  ${et}: ${niveles.length} niveles · ${armC} esperan comprar (${txtC}) · ${armV} esperan vender (${txtV})`);
   return false;
 }
 
