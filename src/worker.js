@@ -52,6 +52,7 @@ const MAX_SCAN     = 9000;    // por corrida (cabe de sobra en el tiempo del Wor
 // Solo lo que el keeper necesita del contrato.
 const ABI = [
   'function gasMinOp() view returns (uint256)',
+  'function misRejillas(address) view returns (bytes32[])',
   'function resumen(address,address,address) view returns (tuple(address base,address quote,bool activa,uint256 niveles,uint256 armados,uint256 creadaEn,uint256 ultimaOpEn,uint256 comprasHechas,uint256 ventasHechas,uint256 ciclos,uint256 totalOps,uint256 posicionBase,uint256 costeQuote,uint256 volumenQuote,int256 gananciaQuote,uint256 gasSaldoWei,uint256 gasGastadoWei,uint256 ordenQuote,uint256 ordenBase,uint128 tpUnitOut,uint128 slUnitOut,uint16 slippageBps,uint32 cooldownSeg,uint24 feeTier,uint256 intervalo,uint32 comprasMax))',
   'function resumen(bytes32) view returns (tuple(address base,address quote,bool activa,uint256 niveles,uint256 armados,uint256 creadaEn,uint256 ultimaOpEn,uint256 comprasHechas,uint256 ventasHechas,uint256 ciclos,uint256 totalOps,uint256 posicionBase,uint256 costeQuote,uint256 volumenQuote,int256 gananciaQuote,uint256 gasSaldoWei,uint256 gasGastadoWei,uint256 ordenQuote,uint256 ordenBase,uint128 tpUnitOut,uint128 slUnitOut,uint16 slippageBps,uint32 cooldownSeg,uint24 feeTier,uint256 intervalo,uint32 comprasMax))',
   'function modoDe(bytes32) view returns (uint8 modo,uint16 objetivoBps)',
@@ -133,6 +134,41 @@ function idGrid(g) {
 /* ================================================================== */
 /* Descubrir rejillas nuevas por eventos                               */
 /* ================================================================== */
+
+/* ── Descubrir preguntando al contrato (no necesita buscar eventos) ──────────
+   Los servidores públicos de BSC no dejan buscar eventos ("limit exceeded"),
+   así que preguntamos directamente: "¿qué bots tiene este usuario?".
+   La lista de usuarios se guarda en el KV y la web la va alimentando. */
+async function descubrirPorUsuarios(cRead, estado, log) {
+  if (!Array.isArray(estado.usuarios)) estado.usuarios = [];
+  if (estado.usuarios.length === 0) { log.push('no hay usuarios vigilados todavía'); return; }
+
+  const vistos = new Set(estado.grids.map(idGrid));
+  for (const u of estado.usuarios) {
+    let claves = [];
+    try { claves = await cRead.misRejillas(u); }
+    catch (e) { log.push(`no pude leer los bots de ${u.slice(0, 8)}: ${e?.shortMessage || e?.message || e}`); continue; }
+    for (const k of claves) {
+      try {
+        const R = await cRead['resumen(bytes32)'](k);
+        if (!R.activa) continue;                       // cancelado o terminado
+        const g = { u, b: R.base, q: R.quote, k };
+        const id = idGrid(g);
+        if (vistos.has(id)) continue;
+        vistos.add(id);
+        estado.grids.push(g);
+        log.push(`bot encontrado: ${R.base.slice(0, 8)}/${R.quote.slice(0, 8)} de ${u.slice(0, 8)}`);
+      } catch (_) {}
+    }
+  }
+  // Limpiamos los que ya no están activos (para no perder tiempo cada minuto).
+  const vivos = [];
+  for (const g of estado.grids) {
+    try { const R = await cRead['resumen(bytes32)'](claveDeG(g)); if (R.activa) vivos.push(g); }
+    catch (_) { vivos.push(g); }
+  }
+  estado.grids = vivos;
+}
 
 async function descubrir(cRead, estado, latest, log) {
   const filtro = cRead.filters.RejillaCreada();
@@ -295,7 +331,10 @@ async function correr(env, log) {
   // Si no conoce ningún bot, mira la ventana reciente (sin irse a la prehistoria).
   if (estado.grids.length === 0) estado.lastBlock = Math.min(estado.lastBlock, Math.max(0, latest - LOOKBACK));
 
-  await descubrir(cRead, estado, latest, log);
+  // 1) Preguntar por los usuarios vigilados (fiable, no depende de eventos).
+  await descubrirPorUsuarios(cRead, estado, log);
+  // 2) Y de paso, intentar hallar bots nuevos por eventos (si el servidor deja).
+  try { await descubrir(cRead, estado, latest, log); } catch (e) { log.push('descubrir por eventos no disponible'); }
 
   let gasMin = 0n;
   try { gasMin = await cRead.gasMinOp(); } catch (_) {}
@@ -319,6 +358,7 @@ async function correr(env, log) {
       bloque: latest,
       lastBlock: estado.lastBlock,
       rejillas: estado.grids.length,
+      usuarios: (estado.usuarios || []).length,
       acciones,
       log: log.slice(-40)
     }));
@@ -351,6 +391,7 @@ export default {
         `Última corrida: hace ${hace} s (${u.cuando})`,
         `Bloque actual de la red: ${u.bloque}`,
         `Bloque escaneado: ${u.lastBlock}   (atraso: ${u.bloque - u.lastBlock} bloques)`,
+        `Cuentas vigiladas: ${u.usuarios ?? 0}`,
         `Bots encontrados: ${u.rejillas}`,
         `Acciones en la última corrida: ${u.acciones}`,
         '',
@@ -358,6 +399,24 @@ export default {
         ...(u.log || [])
       ].join('\n');
       return new Response(txt, { status: 200, headers: { 'content-type': 'text/plain; charset=utf-8' } });
+    }
+
+    // La web avisa al keeper cuando alguien crea un bot: /registrar?u=0xTuWallet
+    // Es inofensivo: solo hace que el keeper vigile esa cuenta (su trabajo).
+    if (url.pathname === '/registrar') {
+      const u = (url.searchParams.get('u') || '').trim();
+      if (!/^0x[0-9a-fA-F]{40}$/.test(u)) {
+        return new Response('dirección no válida', { status: 400, headers: { 'access-control-allow-origin': '*' } });
+      }
+      try {
+        const estado = await cargarEstado(env);
+        if (!Array.isArray(estado.usuarios)) estado.usuarios = [];
+        const ya = estado.usuarios.some((x) => x.toLowerCase() === u.toLowerCase());
+        if (!ya) { estado.usuarios.push(u); await guardarEstado(env, estado); }
+        return new Response(ya ? 'ya estaba' : 'registrado', { status: 200, headers: { 'access-control-allow-origin': '*' } });
+      } catch (e) {
+        return new Response('error', { status: 500, headers: { 'access-control-allow-origin': '*' } });
+      }
     }
 
     if (url.pathname !== '/run') return new Response('ok — usa /estado para ver cómo va', { status: 200 });
