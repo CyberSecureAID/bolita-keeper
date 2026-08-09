@@ -45,9 +45,9 @@ const RPCS = [
 ];
 
 const MAX_ACCIONES = 8;     // máximo de transacciones por corrida (no pasarse de tiempo/gas)
-const RANGO_LOGS   = 500;   // tamaño de ventana al buscar eventos (seguro para RPC públicos)
-const LOOKBACK     = 28000; // al arrancar de cero, mira ~24h atrás para hallar bots ya existentes
-const MAX_SCAN     = 14000; // bloques máximos a escanear por corrida (el resto se sigue en la siguiente)
+const RANGO_LOGS   = 400;   // tamaño de ventana al buscar eventos (seguro para RPC públicos)
+const LOOKBACK     = 40000;   // ~33 h: suficiente para hallar bots recientes // al arrancar de cero, mira ~24h atrás para hallar bots ya existentes
+const MAX_SCAN     = 9000;    // por corrida (cabe de sobra en el tiempo del Worker) // bloques máximos a escanear por corrida (el resto se sigue en la siguiente)
 
 // Solo lo que el keeper necesita del contrato.
 const ABI = [
@@ -137,6 +137,14 @@ function idGrid(g) {
 async function descubrir(cRead, estado, latest, log) {
   const filtro = cRead.filters.RejillaCreada();
   const vistos = new Set(estado.grids.map(idGrid));
+  let fallos = 0;
+  // Nunca perseguir historia antigua: si vamos muy atrás, saltamos al presente.
+  // (Aquí estaba el fallo: intentaba leer ~1 millón de bloques y no avanzaba nunca.)
+  const minimo = Math.max(0, latest - LOOKBACK);
+  if (estado.lastBlock < minimo) {
+    log.push(`me había quedado muy atrás (${estado.lastBlock}); salto a ${minimo}`);
+    estado.lastBlock = minimo;
+  }
   let desde = estado.lastBlock + 1;
   const tope = Math.min(latest, desde + MAX_SCAN - 1); // no más de MAX_SCAN bloques por corrida
   let ventana = RANGO_LOGS;
@@ -147,10 +155,17 @@ async function descubrir(cRead, estado, latest, log) {
     try {
       eventos = await cRead.queryFilter(filtro, desde, hasta);
     } catch (e) {
-      // Si el RPC limita el rango, reduce la ventana y reintenta ese mismo tramo.
-      if (ventana > 100) { ventana = Math.floor(ventana / 2); continue; }
-      log.push(`getLogs ${desde}-${hasta}: ${e?.message || e}`);
-      break; // no avanzamos lastBlock más allá de lo escaneado
+      // Si el servidor limita el rango, probamos con una ventana más pequeña.
+      if (ventana > 50) { ventana = Math.floor(ventana / 2); continue; }
+      // Ni con la ventana mínima: cambiamos de servidor y seguimos ADELANTE.
+      // Antes se quedaba aquí atascado para siempre sin avanzar ni un bloque.
+      log.push(`sin poder leer ${desde}-${hasta} (${e?.message || e}) — sigo adelante`);
+      estado.lastBlock = hasta;
+      desde = hasta + 1;
+      ventana = RANGO_LOGS;
+      fallos++;
+      if (fallos >= 6) { log.push('demasiados tramos ilegibles: lo dejo para la próxima corrida'); break; }
+      continue;
     }
     for (const ev of eventos) {
       const g = { u: ev.args.usuario, b: ev.args.base, q: ev.args.quote, k: ev.args.clave };
@@ -274,9 +289,11 @@ async function correr(env, log) {
 
   const latest = await provider.getBlockNumber();
   const estado = await cargarEstado(env);
-  if (estado.lastBlock === 0) estado.lastBlock = Math.max(0, latest - LOOKBACK); // primera vez: mira atrás para hallar bots existentes
+  if (estado.lastBlock === 0) estado.lastBlock = Math.max(0, latest - LOOKBACK); // primera vez: mira las últimas ~33 h
+  if (estado.lastBlock > latest) estado.lastBlock = Math.max(0, latest - LOOKBACK); // por si quedó adelantado
   // Auto-sanación: si no conoce ningún bot, reescanea la ventana hacia atrás (halla bots que se hayan perdido).
-  if (estado.grids.length === 0 && estado.lastBlock > latest - LOOKBACK) estado.lastBlock = Math.max(0, latest - LOOKBACK);
+  // Si no conoce ningún bot, mira la ventana reciente (sin irse a la prehistoria).
+  if (estado.grids.length === 0) estado.lastBlock = Math.min(estado.lastBlock, Math.max(0, latest - LOOKBACK));
 
   await descubrir(cRead, estado, latest, log);
 
@@ -295,6 +312,17 @@ async function correr(env, log) {
 
   await guardarEstado(env, estado);
   log.push(`corrida ok: ${estado.grids.length} rejillas · ${acciones} acciones`);
+  // Guardamos el informe para poder verlo desde el navegador (/estado)
+  try {
+    if (env.KEEPER_KV) await env.KEEPER_KV.put('ultimo', JSON.stringify({
+      cuando: new Date().toISOString(),
+      bloque: latest,
+      lastBlock: estado.lastBlock,
+      rejillas: estado.grids.length,
+      acciones,
+      log: log.slice(-40)
+    }));
+  } catch (_) {}
 }
 
 /* ================================================================== */
@@ -312,7 +340,27 @@ export default {
   // Disparo/diagnóstico manual:  https://tu-worker.workers.dev/run?key=TU_ADMIN_TOKEN
   async fetch(req, env) {
     const url = new URL(req.url);
-    if (url.pathname !== '/run') return new Response('ok', { status: 200 });
+
+    // Página de estado: mira aquí para saber si el keeper trabaja.
+    if (url.pathname === '/estado') {
+      let u = null;
+      try { u = env.KEEPER_KV ? JSON.parse((await env.KEEPER_KV.get('ultimo')) || 'null') : null; } catch (_) {}
+      if (!u) return new Response('El keeper todavía no ha corrido (o falta el KV).', { status: 200 });
+      const hace = Math.round((Date.now() - new Date(u.cuando).getTime()) / 1000);
+      const txt = [
+        `Última corrida: hace ${hace} s (${u.cuando})`,
+        `Bloque actual de la red: ${u.bloque}`,
+        `Bloque escaneado: ${u.lastBlock}   (atraso: ${u.bloque - u.lastBlock} bloques)`,
+        `Bots encontrados: ${u.rejillas}`,
+        `Acciones en la última corrida: ${u.acciones}`,
+        '',
+        '--- detalle ---',
+        ...(u.log || [])
+      ].join('\n');
+      return new Response(txt, { status: 200, headers: { 'content-type': 'text/plain; charset=utf-8' } });
+    }
+
+    if (url.pathname !== '/run') return new Response('ok — usa /estado para ver cómo va', { status: 200 });
     if (!env.ADMIN_TOKEN || url.searchParams.get('key') !== env.ADMIN_TOKEN) {
       return new Response('no autorizado', { status: 401 });
     }
