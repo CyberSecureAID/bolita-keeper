@@ -317,6 +317,31 @@ async function descubrir(cRead, estado, latest, log) {
 /* Corrida principal                                                   */
 /* ================================================================== */
 
+/** Prueba la operación SIN enviarla. Si el contrato la rechaza, nos dice por
+ *  qué y no gastamos gas. Antes lanzábamos la transacción a ciegas y fallaba
+ *  una y otra vez sin que supiéramos el motivo. */
+async function ensayar(cWrite, fn, args) {
+  try {
+    gasto();
+    await cWrite[fn].staticCall(...args);
+    return { ok: true };
+  } catch (e) {
+    const m = String(e?.reason || e?.shortMessage || e?.info?.error?.message || e?.message || e);
+    return { ok: false, motivo: m.replace(/^execution reverted:?\s*/i, '').slice(0, 120) || 'el contrato lo rechaza' };
+  }
+}
+
+/** Envía solo si el ensayo dice que va a funcionar. */
+async function ejecutarSeguro(cWrite, fn, args, log, et, que) {
+  const prueba = await ensayar(cWrite, fn, args);
+  if (!prueba.ok) { log.push(`  ✋ ${et}: ${que} NO se puede — ${prueba.motivo}`); return false; }
+  gasto(2);
+  const tx = await cWrite[fn](...args);
+  await tx.wait();
+  log.push(`  ✅ ${et}: ${que} · tx ${tx.hash}`);
+  return true;
+}
+
 /** Decide qué hacer con un bot. Ya tiene TODOS los datos leídos: aquí no se
  *  gasta ni una petición salvo que haya que ejecutar de verdad. */
 async function decidir(cWrite, b, gasMin, log, et) {
@@ -330,9 +355,7 @@ async function decidir(cWrite, b, gasMin, log, et) {
     const ahora = BigInt(Math.floor(Date.now() / 1000));
     const proxima = BigInt(R.ultimaOpEn) + BigInt(R.intervalo || 0n);
     if (R.intervalo > 0n && ahora >= proxima) {
-      gasto(2); const tx = await cWrite['comprarDCA(bytes32)'](k); await tx.wait();
-      log.push(`  ${et}: DCA — COMPRA #${Number(R.comprasHechas) + 1}`);
-      return true;
+      return await ejecutarSeguro(cWrite, 'comprarDCA(bytes32)', [k], log, et, `DCA compra #${Number(R.comprasHechas) + 1}`);
     }
     log.push(`  ${et}: DCA — faltan ${Number(proxima - ahora)}s`);
     return false;
@@ -344,9 +367,7 @@ async function decidir(cWrite, b, gasMin, log, et) {
     const sl = R.slUnitOut > 0n && b.outVenta > 0n && b.outVenta <= R.slUnitOut;
     log.push(`  ${et}: TP/SL — precio=${b.outVenta} tp=${R.tpUnitOut} sl=${R.slUnitOut}${tp ? ' ¡ALCANZADO!' : ''}`);
     if (tp || sl) {
-      gasto(2); const tx = await cWrite.cerrarPorTPSL(g.u, g.b, g.q); await tx.wait();
-      log.push(`  ${et}: CIERRE por ${tp ? 'TAKE PROFIT' : 'STOP LOSS'} · tx ${tx.hash}`);
-      return true;
+      return await ejecutarSeguro(cWrite, 'cerrarPorTPSL', [g.u, g.b, g.q], log, et, `cierre por ${tp ? 'TAKE PROFIT' : 'STOP LOSS'}`);
     }
   }
 
@@ -355,9 +376,7 @@ async function decidir(cWrite, b, gasMin, log, et) {
     const minObj = R.costeQuote * (10000n + obj) / 10000n;
     log.push(`  ${et}: ACUM — valor=${b.valorPos} objetivo=${minObj}`);
     if (b.valorPos > 0n && b.valorPos >= minObj) {
-      gasto(2); const tx = await cWrite['venderAcumulado(bytes32)'](k); await tx.wait();
-      log.push(`  ${et}: ACUMULADOR — VENTA TOTAL · tx ${tx.hash}`);
-      return true;
+      return await ejecutarSeguro(cWrite, 'venderAcumulado(bytes32)', [k], log, et, 'venta total del acumulador');
     }
   }
 
@@ -369,16 +388,12 @@ async function decidir(cWrite, b, gasMin, log, et) {
     if (e === 1) {
       armC++;
       if (b.outCompra > 0n && b.outCompra >= BigInt(nv.minOutCompra)) {
-        gasto(2); const tx = await cWrite['ejecutar(bytes32,uint256)'](k, i); await tx.wait();
-        log.push(`  ${et}: COMPRA nivel ${i} · tx ${tx.hash}`);
-        return true;
+        if (await ejecutarSeguro(cWrite, 'ejecutar(bytes32,uint256)', [k, i], log, et, `COMPRA nivel ${i}`)) return true;
       }
     } else if (e === 2) {
       armV++;
       if (b.outVenta > 0n && b.outVenta >= BigInt(nv.minOutVenta)) {
-        gasto(2); const tx = await cWrite['ejecutar(bytes32,uint256)'](k, i); await tx.wait();
-        log.push(`  ${et}: VENTA nivel ${i} · tx ${tx.hash}`);
-        return true;
+        if (await ejecutarSeguro(cWrite, 'ejecutar(bytes32,uint256)', [k, i], log, et, `VENTA nivel ${i}`)) return true;
       }
     }
   }
