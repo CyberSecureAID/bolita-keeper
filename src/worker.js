@@ -44,7 +44,14 @@ const RPCS = [
   'https://1rpc.io/bnb'
 ];
 
-const MAX_ACCIONES = 8;     // máximo de transacciones por corrida (no pasarse de tiempo/gas)
+const MAX_ACCIONES = 8;
+/* Cloudflare corta a las 50 peticiones por corrida. Nos guardamos margen:
+   si nos acercamos, dejamos el resto de bots para la corrida siguiente.
+   Antes reventábamos a mitad y los últimos bots NO se revisaban nunca. */
+const TOPE_PETICIONES = 38;
+let _peticiones = 0;
+const quedaMargen = (cuantas = 1) => (_peticiones + cuantas) <= TOPE_PETICIONES;
+const gasto = (cuantas = 1) => { _peticiones += cuantas; };     // máximo de transacciones por corrida (no pasarse de tiempo/gas)
 const RANGO_LOGS   = 400;   // tamaño de ventana al buscar eventos (seguro para RPC públicos)
 const LOOKBACK     = 40000;   // ~33 h: suficiente para hallar bots recientes // al arrancar de cero, mira ~24h atrás para hallar bots ya existentes
 const MAX_SCAN     = 9000;    // por corrida (cabe de sobra en el tiempo del Worker) // bloques máximos a escanear por corrida (el resto se sigue en la siguiente)
@@ -77,11 +84,26 @@ const QUOTER_ABI = [
 ];
 // Cuánto rinde `amountIn` de tokenIn en tokenOut por V3. Prueba los tiers en el mismo
 // orden que el frontend y usa el primero con liquidez (así coincide con el pool del bot).
+/* Precio por PancakeSwap V2 (respaldo cuando V3 no responde). */
+const ROUTER_V2 = '0x10ED43C718714eb63d5aA57B78B54704E256024E';
+const ROUTER_V2_ABI = ['function getAmountsOut(uint256,address[]) view returns (uint256[])'];
+async function quoteV2(runner, tokenIn, tokenOut, amountIn) {
+  try {
+    const r = new ethers.Contract(ROUTER_V2, ROUTER_V2_ABI, runner);
+    const o = await r.getAmountsOut(amountIn, [tokenIn, tokenOut]);
+    return o[o.length - 1];
+  } catch (_) { return 0n; }
+}
+
 async function quoteV3(quoter, tokenIn, tokenOut, amountIn, feeTier) {
   const ft = Number(feeTier) || 0;
-  const tiers = ft ? [ft, ...FEE_TIERS.filter((t) => t !== ft)] : FEE_TIERS;
+  // Si conocemos la comisión del bot, probamos SOLO esa: cada intento extra
+  // es una petición, y con varios bots nos quedábamos sin presupuesto.
+  const tiers = ft ? [ft] : FEE_TIERS.slice(0, 2);
   for (const fee of tiers) {
+    if (!quedaMargen()) return 0n;
     try {
+      gasto();
       const r = await quoter.quoteExactInputSingle.staticCall({ tokenIn, tokenOut, amountIn, fee, sqrtPriceLimitX96: 0n });
       if (r[0] > 0n) return r[0];
     } catch (_) {}
@@ -121,7 +143,8 @@ async function cargarEstado(env) {
       lastBlock: e.lastBlock || 0,
       grids: Array.isArray(e.grids) ? e.grids : [],
       // OJO: sin esta línea se perdía la lista de cuentas en cada corrida.
-      usuarios: Array.isArray(e.usuarios) ? e.usuarios : []
+      usuarios: Array.isArray(e.usuarios) ? e.usuarios : [],
+      turno: Number(e.turno) || 0
     };
   } catch (_) { return VACIO(); }
 }
@@ -151,30 +174,29 @@ async function descubrirPorUsuarios(cRead, estado, log) {
   if (estado.usuarios.length === 0) { log.push('no hay usuarios vigilados todavía'); return; }
 
   const vistos = new Set(estado.grids.map(idGrid));
+  const conocidas = new Set(estado.grids.map((g) => String(claveDeG(g)).toLowerCase()));
   for (const u of estado.usuarios) {
+    if (!quedaMargen(3)) { log.push('sin presupuesto para buscar bots nuevos; sigo en la próxima'); break; }
     let claves = [];
-    try { claves = await cRead.misRejillas(u); }
+    try { gasto(); claves = await cRead.misRejillas(u); }
     catch (e) { log.push(`no pude leer los bots de ${u.slice(0, 8)}: ${e?.shortMessage || e?.message || e}`); continue; }
     for (const k of claves) {
+      // Si ya la conocemos, ni la consultamos: ahorra una petición por bot.
+      if (conocidas.has(String(k).toLowerCase())) continue;
+      if (!quedaMargen(2)) { log.push('sigo buscando bots nuevos en la próxima corrida'); break; }
       try {
-        const R = await cRead['resumen(bytes32)'](k);
+        gasto();
+        gasto(); const R = await cRead['resumen(bytes32)'](k);
         if (!R.activa) continue;                       // cancelado o terminado
         const g = { u, b: R.base, q: R.quote, k };
         const id = idGrid(g);
         if (vistos.has(id)) continue;
-        vistos.add(id);
+        vistos.add(id); conocidas.add(String(k).toLowerCase());
         estado.grids.push(g);
-        log.push(`bot encontrado: ${R.base.slice(0, 8)}/${R.quote.slice(0, 8)} de ${u.slice(0, 8)}`);
+        log.push(`bot NUEVO encontrado: ${R.base.slice(0, 8)}/${R.quote.slice(0, 8)} de ${u.slice(0, 8)}`);
       } catch (_) {}
     }
   }
-  // Limpiamos los que ya no están activos (para no perder tiempo cada minuto).
-  const vivos = [];
-  for (const g of estado.grids) {
-    try { const R = await cRead['resumen(bytes32)'](claveDeG(g)); if (R.activa) vivos.push(g); }
-    catch (_) { vivos.push(g); }
-  }
-  estado.grids = vivos;
 }
 
 async function descubrir(cRead, estado, latest, log) {
@@ -240,7 +262,11 @@ async function procesarRejilla(cRead, cWrite, g, gasMin, log) {
 
   // Tipo de bot: 0 = cuadrícula · 1 = acumulador
   let modo = 0, objBps = 0n;
-  try { const md = await cRead['modoDe(bytes32)'](k); modo = Number(md[0]); objBps = BigInt(md[1]); } catch (_) {}
+  // El tipo de bot no cambia nunca: lo guardamos y no lo volvemos a pedir.
+  if (g.modo === undefined) {
+    try { gasto(); const md = await cRead['modoDe(bytes32)'](k); g.modo = Number(md[0]); g.obj = String(md[1]); } catch (_) {}
+  }
+  modo = Number(g.modo || 0); objBps = BigInt(g.obj || 0);
 
   // DCA (modo 3): dispara por TIEMPO. Compra cuando ya pasó el intervalo desde la última compra.
   if (modo === 3) {
@@ -258,7 +284,16 @@ async function procesarRejilla(cRead, cWrite, g, gasMin, log) {
 
   // 1) TP/SL primero: si se alcanzó, cierra toda la rejilla.
   if (R.tpUnitOut > 0n || R.slUnitOut > 0n) {
-    const precioVenta = await quoteV3(quoter, g.b, g.q, R.ordenBase, feeTier);
+    let precioVenta = await quoteV3(quoter, g.b, g.q, R.ordenBase, feeTier);
+    // Respaldo por V2: si V3 no cotiza (pool sin liquidez o inexistente),
+    // preguntamos a V2 para no quedarnos con un precio de cero, que nunca
+    // alcanzaría el objetivo y dejaría el bot sin vender jamás.
+    if (precioVenta === 0n) {
+      precioVenta = await quoteV2(cRead.runner, g.b, g.q, R.ordenBase);
+      if (precioVenta > 0n) log.push(`  ${et}: V3 no cotiza, uso V2`);
+    }
+    // Dejamos constancia de los números, para poder ver por qué entra o no.
+    log.push(`  ${et}: TP/SL — precio=${precioVenta} tp=${R.tpUnitOut} sl=${R.slUnitOut} ordenBase=${R.ordenBase} feeTier=${feeTier}`);
     const tp = R.tpUnitOut > 0n && precioVenta >= R.tpUnitOut;
     const sl = R.slUnitOut > 0n && precioVenta <= R.slUnitOut;
     if (tp || sl) {
@@ -270,7 +305,8 @@ async function procesarRejilla(cRead, cWrite, g, gasMin, log) {
   }
 
   // 2) Niveles: una cotización por dirección sirve para todos los niveles.
-  const niveles = await cRead.nivelesDe(k);
+  if (!quedaMargen(3)) { log.push(`  ${et}: sin presupuesto, sigo en la próxima corrida`); return false; }
+  gasto(); const niveles = await cRead.nivelesDe(k);
   const outCompra = await quoteV3(quoter, g.q, g.b, R.ordenQuote, feeTier); // base que rinde ordenQuote (V3)
   const outVenta  = await quoteV3(quoter, g.b, g.q, R.ordenBase, feeTier);  // quote que rinde ordenBase (V3)
 
@@ -323,6 +359,7 @@ async function procesarRejilla(cRead, cWrite, g, gasMin, log) {
 /* ================================================================== */
 
 async function correr(env, log) {
+  _peticiones = 0;
   if (!env.KEEPER_PRIVATE_KEY) { log.push('falta KEEPER_PRIVATE_KEY'); return; }
 
   const provider = await getProvider();
@@ -347,8 +384,17 @@ async function correr(env, log) {
   let gasMin = 0n;
   try { gasMin = await cRead.gasMinOp(); } catch (_) {}
 
+  // Repartimos por turnos: si no caben todos, seguimos por donde nos quedamos.
+  // Así ningún bot se queda sin revisar nunca (antes los últimos nunca entraban).
+  const total = estado.grids.length;
+  const inicio = total ? (Number(estado.turno || 0) % total) : 0;
+  const orden = estado.grids.slice(inicio).concat(estado.grids.slice(0, inicio));
+  let revisados = 0;
+
   let acciones = 0;
-  for (const g of estado.grids) {
+  for (const g of orden) {
+    if (!quedaMargen(6)) { log.push(`me quedo sin presupuesto: sigo con el resto en la próxima corrida`); break; }
+    revisados++;
     if (acciones >= MAX_ACCIONES) break;
     try {
       if (await procesarRejilla(cRead, cWrite, g, gasMin, log)) acciones++;
@@ -357,8 +403,9 @@ async function correr(env, log) {
     }
   }
 
+  estado.turno = total ? ((inicio + revisados) % total) : 0;
   await guardarEstado(env, estado);
-  log.push(`corrida ok: ${estado.grids.length} rejillas · ${acciones} acciones`);
+  log.push(`corrida ok: ${revisados}/${total} rejillas revisadas · ${acciones} acciones · ${_peticiones} peticiones`);
   // Guardamos el informe para poder verlo desde el navegador (/estado)
   try {
     if (env.KEEPER_KV) await env.KEEPER_KV.put('ultimo', JSON.stringify({
@@ -367,6 +414,7 @@ async function correr(env, log) {
       lastBlock: estado.lastBlock,
       rejillas: estado.grids.length,
       usuarios: (estado.usuarios || []).length,
+      revisados, peticiones: _peticiones,
       acciones,
       log: log.slice(-40)
     }));
@@ -401,6 +449,7 @@ export default {
         `Bloque escaneado: ${u.lastBlock}   (atraso: ${u.bloque - u.lastBlock} bloques)`,
         `Cuentas vigiladas: ${u.usuarios ?? 0}`,
         `Bots encontrados: ${u.rejillas}`,
+        `Revisados en esta corrida: ${u.revisados ?? '?'} (peticiones: ${u.peticiones ?? '?'} de 50)`,
         `Acciones en la última corrida: ${u.acciones}`,
         '',
         '--- detalle ---',
