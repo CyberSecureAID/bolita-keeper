@@ -1,4 +1,4 @@
-name = "bolita-keeper"
+name = "bolita-keeper-bot"
 main = "src/worker.js"
 compatibility_date = "2024-09-01"
 compatibility_flags = ["nodejs_compat"]
@@ -6,3 +6,14 @@ compatibility_flags = ["nodejs_compat"]
 # El keeper mira los precios cada minuto.
 [triggers]
 crons = ["* * * * *"]
+
+# ── MEMORIA DEL KEEPER ────────────────────────────────────────────────────────
+# IMPRESCINDIBLE. Aquí guarda qué bots conoce y por qué bloque va.
+# Sin esta línea, cada despliegue borraba la conexión al KV que se hacía a mano
+# en el panel, y el keeper se quedaba sin memoria (y sin encontrar ningún bot).
+[[kv_namespaces]]
+binding = "KEEPER_KV"
+id = "0759bdf9e97e47158364ce2ef08f6f6a"
+
+# Los secretos (KEEPER_PRIVATE_KEY, ADMIN_TOKEN) NO van aquí: viven cifrados en
+# Cloudflare y sobreviven a los despliegues.
