@@ -366,12 +366,10 @@ async function ejecutarSeguro(cWrite, fn, args, log, et, que) {
 async function decidir(cWrite, b, gasMin, log, et) {
   const { g, R, modo, obj, niveles } = b;
   const k = claveDeG(g);
-  // Margen anti-revert: solo se dispara cuando la salida supera el mínimo con un
-  // pequeño colchón (0.3%). Sin esto, el keeper disparaba justo al igualar el
-  // mínimo y, en los segundos hasta minar la tx, el precio se movía y el swap
-  // revertía (por eso TODAS las ejecuciones revertían aunque la simulación pasara).
-  const MARGEN = 1003n, BASE = 1000n;
-  const supera = (out, min) => out > 0n && out * BASE >= BigInt(min) * MARGEN;
+  // Se dispara EXACTAMENTE cuando el precio alcanza el nivel del usuario (su
+  // precio, sin márgenes añadidos). La tolerancia de slippage del swap la maneja
+  // el propio contrato con su slippageBps.
+  const supera = (out, min) => out > 0n && out >= BigInt(min);
 
   if (R.gasSaldoWei < gasMin) { log.push(`  ${et}: SIN GAS — el usuario debe recargar BNB`); return false; }
 
