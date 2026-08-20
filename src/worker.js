@@ -37,11 +37,18 @@ const GRIDBOT = '0x4e86430BC2260FE359d1Ea7Eef8B595fB241F93B';
 
 // RPC públicos de BSC (gratis, sin API key). Se prueban en orden.
 const RPCS = [
-  'https://bsc-dataseed.binance.org',
-  'https://bsc-dataseed1.defibit.io',
-  'https://bsc-dataseed1.ninicoin.io',
+  // Primero los que responden BIEN desde los servidores de Cloudflare (los
+  // dataseed oficiales suelen limitar/bloquear las IPs de Workers en los picos).
   'https://bsc-rpc.publicnode.com',
-  'https://1rpc.io/bnb'
+  'https://binance.llamarpc.com',
+  'https://bsc.drpc.org',
+  'https://bsc.blockrazor.xyz',
+  'https://1rpc.io/bnb',
+  'https://bsc-pokt.nodies.app',
+  // Respaldo: los dataseed oficiales (pueden fallar desde Cloudflare).
+  'https://bsc-dataseed.bnbchain.org',
+  'https://bsc-dataseed1.defibit.io',
+  'https://bsc-dataseed1.ninicoin.io'
 ];
 
 const MAX_ACCIONES = 8;
@@ -474,7 +481,11 @@ async function correr(env, log, parte = 0, departes = 1) {
   const cRead    = new ethers.Contract(GRIDBOT, ABI, provider);
   const cWrite   = new ethers.Contract(GRIDBOT, ABI, wallet);
 
-  const latest = await provider.getBlockNumber();
+  // Si el RPC elegido se cae justo al pedir el bloque, se prueba con otro antes
+  // de rendirse (evita que un RPC flojo tumbe la corrida entera).
+  let latest;
+  try { latest = await provider.getBlockNumber(); }
+  catch (_) { const p2 = await getProvider(); latest = await p2.getBlockNumber(); }
   const estado = await cargarEstado(env);
   if (estado.lastBlock === 0) estado.lastBlock = Math.max(0, latest - LOOKBACK); // primera vez: mira las últimas ~33 h
   if (estado.lastBlock > latest) estado.lastBlock = Math.max(0, latest - LOOKBACK); // por si quedó adelantado
@@ -577,7 +588,18 @@ export default {
   async scheduled(event, env, ctx) {
     const log = [];
     try { await repartir(env, log); }
-    catch (e) { log.push('ERROR: ' + (e?.message || e)); }
+    catch (e) {
+      log.push('ERROR: ' + (e?.message || e));
+      // IMPRESCINDIBLE: registrar también los fallos, para que /estado NO quede
+      // congelado en la última corrida buena. Así se ve el error y su hora real.
+      try {
+        if (env.KEEPER_KV) await env.KEEPER_KV.put('ultimo', JSON.stringify({
+          cuando: new Date().toISOString(), bloque: 0, lastBlock: 0,
+          rejillas: '?', usuarios: '?', revisados: 0, peticiones: _peticiones, acciones: 0,
+          log: ['⚠ La corrida falló (probable RPC caído). Reintenta en 1 min.', ...log.slice(-30)]
+        }));
+      } catch (_) {}
+    }
     console.log(log.join('\n'));
   },
 
