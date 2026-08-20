@@ -172,10 +172,16 @@ async function quoteV3(quoter, tokenIn, tokenOut, amountIn, feeTier) {
 
 /** Devuelve el primer RPC que responde. */
 async function getProvider() {
+  const cMin = new ethers.Interface(['function gasMinOp() view returns (uint256)']);
+  const datosTest = cMin.encodeFunctionData('gasMinOp', []);
   for (const url of RPCS) {
     try {
       const p = new ethers.JsonRpcProvider(url, 56, { staticNetwork: true });
       await p.getBlockNumber();
+      // Prueba REAL: una llamada eth_call al contrato. Muchos RPC responden el
+      // número de bloque pero devuelven 403 en las llamadas de lectura; así se
+      // descartan aquí y no dejan al keeper "ciego" ante el precio.
+      await p.call({ to: GRIDBOT, data: datosTest });
       return p;
     } catch (_) { /* prueba el siguiente */ }
   }
@@ -334,6 +340,12 @@ async function ensayar(cWrite, fn, args) {
     return { ok: true };
   } catch (e) {
     const m = String(e?.reason || e?.shortMessage || e?.info?.error?.message || e?.message || e);
+    // Un 403/429/timeout NO es un rechazo del contrato: es el RPC fallando. Se
+    // relanza para que la corrida reintente con otro RPC (no marca la orden como
+    // imposible ni la salta en silencio).
+    if (/403|forbidden|429|timeout|rate.?limit|bad response|server response|network|failed to fetch/i.test(m)) {
+      throw new Error('RPC ' + m.slice(0, 80));
+    }
     return { ok: false, motivo: m.replace(/^execution reverted:?\s*/i, '').slice(0, 120) || 'el contrato lo rechaza' };
   }
 }
@@ -354,6 +366,12 @@ async function ejecutarSeguro(cWrite, fn, args, log, et, que) {
 async function decidir(cWrite, b, gasMin, log, et) {
   const { g, R, modo, obj, niveles } = b;
   const k = claveDeG(g);
+  // Margen anti-revert: solo se dispara cuando la salida supera el mínimo con un
+  // pequeño colchón (0.3%). Sin esto, el keeper disparaba justo al igualar el
+  // mínimo y, en los segundos hasta minar la tx, el precio se movía y el swap
+  // revertía (por eso TODAS las ejecuciones revertían aunque la simulación pasara).
+  const MARGEN = 1003n, BASE = 1000n;
+  const supera = (out, min) => out > 0n && out * BASE >= BigInt(min) * MARGEN;
 
   if (R.gasSaldoWei < gasMin) { log.push(`  ${et}: SIN GAS — el usuario debe recargar BNB`); return false; }
 
@@ -370,7 +388,7 @@ async function decidir(cWrite, b, gasMin, log, et) {
 
   // Take Profit / Stop Loss: cierra la posición entera.
   if (R.tpUnitOut > 0n || R.slUnitOut > 0n) {
-    const tp = R.tpUnitOut > 0n && b.outVenta >= R.tpUnitOut;
+    const tp = R.tpUnitOut > 0n && supera(b.outVenta, R.tpUnitOut);
     const sl = R.slUnitOut > 0n && b.outVenta > 0n && b.outVenta <= R.slUnitOut;
     const faltaTP = R.tpUnitOut > 0n && b.outVenta > 0n ? Number((BigInt(R.tpUnitOut) - b.outVenta) * 10000n / BigInt(R.tpUnitOut)) / 100 : null;
     log.push(`  ${et}: TAKE PROFIT — ${tp ? '¡ALCANZADO! vendiendo' : faltaTP === null ? 'esperando' : `falta ${faltaTP.toFixed(2)}% de subida`}${sl ? ' · STOP LOSS alcanzado' : ''}`);
@@ -384,7 +402,7 @@ async function decidir(cWrite, b, gasMin, log, et) {
     const minObj = R.costeQuote * (10000n + obj) / 10000n;
     const faltaA = minObj > 0n && b.valorPos > 0n ? Number((minObj - b.valorPos) * 10000n / minObj) / 100 : null;
     log.push(`  ${et}: ACUMULADOR — ${faltaA === null ? 'sin datos' : faltaA <= 0 ? '¡objetivo alcanzado!' : `falta ${faltaA.toFixed(2)}% para vender todo`}`);
-    if (b.valorPos > 0n && b.valorPos >= minObj) {
+    if (b.valorPos > 0n && supera(b.valorPos, minObj)) {
       return await ejecutarSeguro(cWrite, 'venderAcumulado(bytes32)', [k], log, et, 'venta total del acumulador');
     }
   }
@@ -396,12 +414,12 @@ async function decidir(cWrite, b, gasMin, log, et) {
     const e = Number(nv.estado);
     if (e === 1) {
       armC++;
-      if (b.outCompra > 0n && b.outCompra >= BigInt(nv.minOutCompra)) {
+      if (supera(b.outCompra, nv.minOutCompra)) {
         if (await ejecutarSeguro(cWrite, 'ejecutar(bytes32,uint256)', [k, i], log, et, `COMPRA nivel ${i}`)) return true;
       }
     } else if (e === 2) {
       armV++;
-      if (b.outVenta > 0n && b.outVenta >= BigInt(nv.minOutVenta)) {
+      if (supera(b.outVenta, nv.minOutVenta)) {
         if (await ejecutarSeguro(cWrite, 'ejecutar(bytes32,uint256)', [k, i], log, et, `VENTA nivel ${i}`)) return true;
       }
     }
